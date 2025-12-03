@@ -157,34 +157,31 @@ def compute_anomaly_score(predicted_sketch, actual_sketch):
 
 
 def compute_trust_weights(anomaly_scores, method='softmax', threshold=0.2):
-    """
-    Compute trust weights based on anomaly scores.
-
-    Args:
-        anomaly_scores: Anomaly scores for each cluster [num_clusters]
-        method: 'softmax' or 'threshold'
-        threshold: Top percentage to filter (only for 'threshold' method)
-    Returns:
-        weights: Trust weights for each cluster [num_clusters]
-    """
     num_clusters = len(anomaly_scores)
 
     if method == 'softmax':
+        # --- FIX START: Normalize scores to prevent softmax saturation ---
+        # 1. 减去最小值防止数值过大
+        scores = anomaly_scores - anomaly_scores.min()
+        # 2. 缩放到一定范围 (例如 0-10)，防止差异过大导致 one-hot
+        if scores.max() > 0:
+            scores = scores / scores.max() * 5.0  # Temperature scaling
+
         # Softmax of negative scores: lower anomaly -> higher weight
-        weights = F.softmax(-anomaly_scores, dim=0)
+        weights = F.softmax(-scores, dim=0)
+        # --- FIX END ---
+
     elif method == 'threshold':
-        # Filter top threshold% anomalous clusters
+        # ... (保持原有逻辑)
         k = max(1, int(num_clusters * threshold))
         _, top_indices = torch.topk(anomaly_scores, k)
         weights = torch.ones(num_clusters, device=anomaly_scores.device)
         weights[top_indices] = 0
-        # Normalize remaining weights
         if weights.sum() > 0:
             weights = weights / weights.sum()
         else:
             weights = torch.ones(num_clusters, device=anomaly_scores.device) / num_clusters
     else:
-        # Default: uniform weights
         weights = torch.ones(num_clusters, device=anomaly_scores.device) / num_clusters
 
     return weights
@@ -211,7 +208,7 @@ class SketchedAirDefense:
 
         # Physical layer parameters
         self.B = 1e+6  # Bandwidth
-        self.N0 = 1e-7  # Noise power spectral density
+        self.N0 = 0 #1e-7  # Noise power spectral density
 
         # Initialize sketcher
         self.sketcher = GradientSketcher(model_dim, args.sketch_dim, device)
