@@ -506,11 +506,14 @@ class SketchedAirDefense:
         reputation = self.update_reputation(reputation, trust_weights, cluster_assignments)
 
         # Step 8: Weighted aggregation with physical layer effects
+        # FIX Bug 2: 除以 Cluster 的大小进行归一化
+        # cluster_update 是多个用户更新的叠加，需要除以用户数
         w_new = copy.deepcopy(w_global)
         for key in sorted(w_new.keys()):
             weighted_update = torch.zeros_like(w_new[key], dtype=torch.float32).to(self.device)
             for c, (cluster_update, weight) in enumerate(zip(cluster_updates, trust_weights)):
-                weighted_update += weight.item() * cluster_update[key]
+                num_users_in_cluster = len(cluster_assignments[c])
+                weighted_update += (weight.item() * cluster_update[key]) / num_users_in_cluster
             w_new[key] = w_global[key].float() + weighted_update
 
         # Update q (queue state) - simple update based on trust
