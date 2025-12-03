@@ -311,12 +311,11 @@ class SketchedAirDefense:
                     for key in sorted(w_global.keys()):
                         cluster_agg[key] = torch.zeros_like(w_global[key], dtype=torch.float32).to(self.device)
 
-                # AirComp signal model: scale by channel condition
-                if H[user_idx][round_idx] > 0.1:
-                    # Transmit with channel scaling
-                    h_scale = np.sqrt(P[user_idx]) * G[user_idx][round_idx] / min_h
+                # FIX Bug 1: 简化的 AirComp 模拟 (Perfect Power Control Assumption)
+                # 移除除法操作，假设预编码已经抵消了信道差异，直接叠加
+                if H[user_idx][round_idx] > 0.1:  # 仅当信道足够好时才参与
                     for key in cluster_agg.keys():
-                        cluster_agg[key] += user_update[key] / h_scale
+                        cluster_agg[key] += user_update[key]  # 直接叠加
 
             # Add AWGN noise (simulating over-the-air transmission)
             noise_std = np.sqrt(self.B * self.N0 / 2) * self.args.lr / min_h
