@@ -52,6 +52,11 @@ def args_parser():
     parser.add_argument('--pred_lr', type=float, default=0.001, help="learning rate for trajectory predictor")
     parser.add_argument('--anomaly_threshold', type=float, default=0.2, help="top percentage of clusters to filter (0-1)")
 
+    # Defense-aware predictor arguments (new)
+    parser.add_argument('--lambda_adv', type=float, default=0.5, help="weight for adversarial loss in defense-aware training")
+    parser.add_argument('--warmup_rounds', type=int, default=3, help="soft-landing warmup rounds after cluster switch")
+    parser.add_argument('--use_defense_aware', action='store_true', default=True, help="use defense-aware LSTM predictor instead of GRU")
+
 
     args = parser.parse_args()
     

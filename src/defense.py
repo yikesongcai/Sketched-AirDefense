@@ -141,6 +141,162 @@ class TrajectoryPredictor(nn.Module):
         return prediction
 
 
+class DefenseAwarePredictor(nn.Module):
+    """
+    Defense-Aware Trajectory Predictor using LSTM.
+    Designed to resist slow-poisoning attacks through adversarial training.
+
+    Key insight: The predictor is trained to be ROBUST against small drifts,
+    so when actual attacks cause drift, the prediction error becomes large,
+    triggering defense mechanisms.
+    """
+    def __init__(self, input_dim=256, hidden_dim=128, num_layers=1):
+        """
+        Args:
+            input_dim: Dimension of input sketch vectors
+            hidden_dim: Hidden dimension of LSTM
+            num_layers: Number of LSTM layers
+        """
+        super(DefenseAwarePredictor, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_dim,
+                            hidden_size=hidden_dim,
+                            num_layers=num_layers,
+                            batch_first=True)
+        self.head = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x):
+        """
+        Predict next sketch based on history.
+
+        Args:
+            x: [batch_size, seq_len, input_dim] history trajectory
+        Returns:
+            pred: [batch_size, input_dim] predicted next sketch
+        """
+        out, (h_n, c_n) = self.lstm(x)
+        # Take the output of the last timestep
+        pred = self.head(out[:, -1, :])
+        return pred
+
+
+def defense_aware_loss(model, history_batch, true_target, lambda_adv=0.5, device='cuda'):
+    """
+    Defense-aware loss function combining MSE and adversarial robustness.
+
+    The adversarial loss trains the model to be robust against slow drifting attacks.
+    When input history has small cumulative drift, the model should still predict
+    the NORMAL (un-drifted) target, not follow the drift.
+
+    Args:
+        model: DefenseAwarePredictor or TrajectoryPredictor
+        history_batch: [batch, window_size, dim] normal history trajectories
+        true_target: [batch, dim] true next-round sketches
+        lambda_adv: Weight for adversarial loss (default 0.5)
+        device: torch device
+    Returns:
+        total_loss: Combined loss (L_mse + lambda * L_adv)
+        loss_mse: MSE loss component
+        loss_adv: Adversarial loss component
+    """
+    # 1. Normal prediction loss (MSE)
+    pred_normal = model(history_batch)
+    loss_mse = F.mse_loss(pred_normal, true_target)
+
+    # 2. Generate simulated "slow-poisoning" attack samples
+    # Attack method: Add small linear drift to history trajectory
+    # Simulates attacker gradually shifting gradients in a random direction
+
+    # Random drift direction (normalized)
+    drift_dir = torch.randn_like(true_target).to(device)
+    drift_dir = drift_dir / (torch.norm(drift_dir, dim=1, keepdim=True) + 1e-8)
+
+    # Create adversarial history by adding cumulative drift
+    adv_history = history_batch.clone()
+    seq_len = history_batch.size(1)
+
+    # Drift magnitude increases over time (simulating slow poisoning)
+    drift_scale = 0.05  # Small drift per timestep
+    for t in range(seq_len):
+        # Cumulative drift: (t+1) * drift_scale * direction
+        noise = (t + 1) * drift_scale * drift_dir.unsqueeze(1)
+        adv_history[:, t, :] = adv_history[:, t, :] + noise.squeeze(1)
+
+    # 3. Compute adversarial loss
+    # Goal: Even with drifted input, prediction should stay close to TRUE target
+    # This makes the model ROBUST - it won't follow the drift
+    # When real attack happens, prediction stays normal but received signal drifts
+    # -> Large gap -> Anomaly detected!
+    pred_adv = model(adv_history)
+    loss_adv = F.mse_loss(pred_adv, true_target)
+
+    # Total loss: accuracy + robustness
+    total_loss = loss_mse + lambda_adv * loss_adv
+
+    return total_loss, loss_mse, loss_adv
+
+
+def handle_cluster_switch(client_id, old_cluster_id, new_cluster_id,
+                          cluster_states, client_states, warmup_rounds=3):
+    """
+    Handle client switching from one cluster to another.
+
+    Implements state inheritance and soft-landing mechanism:
+    1. State Reset: Client discards its own history
+    2. State Inherit: Client inherits new cluster's centroid history
+    3. Soft-Landing: Client has reduced weight for warmup_rounds
+
+    Args:
+        client_id: ID of the client switching clusters
+        old_cluster_id: ID of the old cluster
+        new_cluster_id: ID of the new cluster
+        cluster_states: Dictionary tracking each cluster's state
+            {cluster_id: {'centroid_history': tensor, 'members': set}}
+        client_states: Dictionary tracking each client's state
+            {client_id: {'history': tensor, 'warmup_counter': int, 'cluster_id': int}}
+        warmup_rounds: Number of rounds for soft-landing (default 3)
+    """
+    # 1. Inherit new cluster's history state
+    if new_cluster_id in cluster_states and 'centroid_history' in cluster_states[new_cluster_id]:
+        client_states[client_id]['history'] = cluster_states[new_cluster_id]['centroid_history'].clone()
+
+    # 2. Set warmup flag for soft-landing
+    client_states[client_id]['warmup_counter'] = warmup_rounds
+
+    # 3. Update cluster membership
+    client_states[client_id]['cluster_id'] = new_cluster_id
+
+    # 4. Update cluster member sets
+    if old_cluster_id in cluster_states:
+        cluster_states[old_cluster_id]['members'].discard(client_id)
+    if new_cluster_id not in cluster_states:
+        cluster_states[new_cluster_id] = {'members': set(), 'centroid_history': None}
+    cluster_states[new_cluster_id]['members'].add(client_id)
+
+
+def compute_warmup_weight(base_weight, warmup_counter, warmup_rounds=3):
+    """
+    Compute adjusted weight for clients in warm-up phase after cluster switch.
+
+    Weight gradually increases from 0.5 * base_weight to base_weight
+    over warmup_rounds rounds.
+
+    Args:
+        base_weight: Original weight before warm-up adjustment
+        warmup_counter: Remaining warm-up rounds (decreases each round)
+        warmup_rounds: Total warm-up rounds
+    Returns:
+        adjusted_weight: Weight adjusted for warm-up phase
+    """
+    if warmup_counter <= 0:
+        return base_weight
+
+    # Linear warm-up: weight increases from 0.5 to 1.0 over warmup_rounds
+    progress = 1.0 - (warmup_counter / warmup_rounds)
+    warmup_factor = 0.5 + 0.5 * progress
+
+    return base_weight * warmup_factor
+
+
 def compute_anomaly_score(predicted_sketch, actual_sketch):
     """
     Compute prediction error as anomaly score.
@@ -191,6 +347,12 @@ class SketchedAirDefense:
     """
     Main defense module that combines sketching and trajectory prediction
     with AirComp physical layer simulation.
+
+    Enhanced with:
+    - Defense-aware trajectory predictor (LSTM)
+    - Adversarial training loss
+    - Dynamic cluster state tracking
+    - Soft-landing mechanism for cluster switching
     """
     def __init__(self, args, model_dim, device):
         """
@@ -208,17 +370,29 @@ class SketchedAirDefense:
 
         # Physical layer parameters
         self.B = 1e+6  # Bandwidth
-        self.N0 = 0 #1e-7  # Noise power spectral density
+        self.N0 = 1e-7  # Noise power spectral density
+
+        # Defense-aware training parameters
+        self.lambda_adv = getattr(args, 'lambda_adv', 0.5)  # Adversarial loss weight
+        self.warmup_rounds = getattr(args, 'warmup_rounds', 3)  # Soft-landing rounds
+        self.use_defense_aware = getattr(args, 'use_defense_aware', True)  # Use defense-aware predictor
 
         # Initialize sketcher
         self.sketcher = GradientSketcher(model_dim, args.sketch_dim, device)
 
-        # Initialize predictor
-        self.predictor = TrajectoryPredictor(
-            sketch_dim=args.sketch_dim,
-            hidden_dim=args.pred_hidden,
-            num_layers=1
-        ).to(device)
+        # Initialize predictor (choose between defense-aware LSTM or standard GRU)
+        if self.use_defense_aware:
+            self.predictor = DefenseAwarePredictor(
+                input_dim=args.sketch_dim,
+                hidden_dim=args.pred_hidden,
+                num_layers=1
+            ).to(device)
+        else:
+            self.predictor = TrajectoryPredictor(
+                sketch_dim=args.sketch_dim,
+                hidden_dim=args.pred_hidden,
+                num_layers=1
+            ).to(device)
 
         # Optimizer for predictor
         self.predictor_optimizer = torch.optim.Adam(
@@ -232,6 +406,21 @@ class SketchedAirDefense:
 
         # Loss function for self-supervised learning (per-sample loss for selective training)
         self.loss_fn = nn.MSELoss(reduction='none')
+
+        # --- New: State tracking for dynamic clustering ---
+        # Cluster states: track each cluster's centroid history and members
+        self.cluster_states = {}
+        for c in range(self.num_clusters):
+            self.cluster_states[c] = {
+                'centroid_history': None,  # Will store cluster's aggregated sketch history
+                'members': set()  # Set of user IDs in this cluster
+            }
+
+        # Client states: track each client's individual state
+        self.client_states = {}  # Will be initialized when users are assigned
+
+        # Previous cluster assignments for detecting switches
+        self.prev_cluster_assignments = None
 
     def get_cluster_assignments(self, num_users, round_idx):
         """
@@ -381,18 +570,18 @@ class SketchedAirDefense:
 
     def update_predictor_selective(self, current_sketches, anomaly_scores, trust_weights):
         """
-        Update predictor using ONLY normal samples to prevent attack adaptation.
-        FIX: Only train on clusters with low anomaly scores (judged as normal).
+        Update predictor using ONLY normal samples with defense-aware loss.
+        Uses adversarial training to make predictor robust against slow drift attacks.
 
         Args:
             current_sketches: Current round's sketches [num_clusters, sketch_dim]
             anomaly_scores: Anomaly scores [num_clusters]
             trust_weights: Trust weights [num_clusters]
         Returns:
-            loss_value: The training loss (0 if no training occurred)
+            loss_info: Dictionary containing loss components
         """
         if len(self.history_buffer) < self.window_size:
-            return 0.0
+            return {'total': 0.0, 'mse': 0.0, 'adv': 0.0}
 
         # Determine which clusters are "normal" (below median anomaly score)
         median_score = torch.median(anomaly_scores)
@@ -403,26 +592,37 @@ class SketchedAirDefense:
         normal_mask = normal_mask & (trust_weights > trust_threshold)
 
         if normal_mask.sum() == 0:
-            return 0.0  # No normal samples to train on
+            return {'total': 0.0, 'mse': 0.0, 'adv': 0.0}  # No normal samples to train on
 
-        # Prepare history tensor
+        # Prepare history tensor [num_clusters, window_size, sketch_dim]
         history = torch.stack(list(self.history_buffer), dim=1)
 
-        # Train predictor only on normal clusters
+        # Select only normal clusters for training
+        normal_indices = torch.where(normal_mask)[0]
+        normal_history = history[normal_indices]
+        normal_targets = current_sketches[normal_indices]
+
+        # Train predictor with defense-aware loss
         self.predictor.train()
-        predicted_sketches = self.predictor(history)
-
-        # Compute per-cluster loss
-        per_cluster_loss = self.loss_fn(predicted_sketches, current_sketches).mean(dim=1)
-
-        # Only backprop on normal clusters
-        masked_loss = (per_cluster_loss * normal_mask.float()).sum() / normal_mask.sum()
-
         self.predictor_optimizer.zero_grad()
-        masked_loss.backward()
+
+        # Use defense-aware loss for adversarial robustness training
+        total_loss, loss_mse, loss_adv = defense_aware_loss(
+            self.predictor,
+            normal_history,
+            normal_targets,
+            lambda_adv=self.lambda_adv,
+            device=self.device
+        )
+
+        total_loss.backward()
         self.predictor_optimizer.step()
 
-        return masked_loss.item()
+        return {
+            'total': total_loss.item(),
+            'mse': loss_mse.item(),
+            'adv': loss_adv.item()
+        }
 
     def update_history(self, current_sketches):
         """
@@ -461,6 +661,11 @@ class SketchedAirDefense:
         """
         Main defense aggregation function with AirComp simulation.
 
+        Enhanced with:
+        - Defense-aware predictor training
+        - Cluster state tracking
+        - Soft-landing for cluster switches
+
         Args:
             w_locals: List of local model weights
             w_global: Current global model weights
@@ -477,8 +682,39 @@ class SketchedAirDefense:
             q: Updated queue state
             defense_info: Dictionary with defense statistics
         """
+        num_users = args.num_users - 1  # Exclude server
+
+        # Step 0: Initialize client states if first round
+        if len(self.client_states) == 0:
+            for user_idx in range(num_users):
+                self.client_states[user_idx] = {
+                    'history': None,
+                    'warmup_counter': 0,
+                    'cluster_id': -1  # Will be set during assignment
+                }
+
         # Step 1: Get cluster assignments
         cluster_assignments = self.get_cluster_assignments(args.num_users, round_idx)
+
+        # Step 1.5: Detect cluster switches and handle handover
+        cluster_switches = []
+        for cluster_idx, cluster_users in enumerate(cluster_assignments):
+            for user_idx in cluster_users:
+                old_cluster = self.client_states[user_idx]['cluster_id']
+                if old_cluster != -1 and old_cluster != cluster_idx:
+                    # User switched clusters!
+                    cluster_switches.append((user_idx, old_cluster, cluster_idx))
+                    handle_cluster_switch(
+                        user_idx, old_cluster, cluster_idx,
+                        self.cluster_states, self.client_states,
+                        warmup_rounds=self.warmup_rounds
+                    )
+                else:
+                    # First assignment or same cluster
+                    self.client_states[user_idx]['cluster_id'] = cluster_idx
+                    if cluster_idx not in self.cluster_states:
+                        self.cluster_states[cluster_idx] = {'members': set(), 'centroid_history': None}
+                    self.cluster_states[cluster_idx]['members'].add(user_idx)
 
         # Step 2: Compute cluster updates with AirComp physical layer simulation
         cluster_updates, cluster_scaling = self.compute_cluster_updates_with_aircomp(
@@ -488,11 +724,15 @@ class SketchedAirDefense:
         # Step 3: Extract sketches
         current_sketches = self.extract_sketches(cluster_updates)
 
+        # Step 3.5: Update cluster centroid histories
+        for cluster_idx in range(self.num_clusters):
+            self.cluster_states[cluster_idx]['centroid_history'] = current_sketches[cluster_idx].detach().clone()
+
         # Step 4: Predict and detect anomalies
         trust_weights, anomaly_scores, _ = self.predict_and_detect(current_sketches)
 
-        # Step 5: Update predictor ONLY with normal samples (prevent attack adaptation)
-        predictor_loss = self.update_predictor_selective(
+        # Step 5: Update predictor with defense-aware loss
+        predictor_loss_info = self.update_predictor_selective(
             current_sketches, anomaly_scores, trust_weights
         )
 
@@ -502,18 +742,36 @@ class SketchedAirDefense:
         # Step 7: Update reputation based on trust weights
         reputation = self.update_reputation(reputation, trust_weights, cluster_assignments)
 
-        # Step 8: Weighted aggregation with physical layer effects
-        # FIX Bug 2: 除以 Cluster 的大小进行归一化
-        # cluster_update 是多个用户更新的叠加，需要除以用户数
+        # Step 8: Weighted aggregation with soft-landing adjustment
         w_new = copy.deepcopy(w_global)
         for key in sorted(w_new.keys()):
             weighted_update = torch.zeros_like(w_new[key], dtype=torch.float32).to(self.device)
             for c, (cluster_update, weight) in enumerate(zip(cluster_updates, trust_weights)):
                 num_users_in_cluster = len(cluster_assignments[c])
-                weighted_update += (weight.item() * cluster_update[key]) / num_users_in_cluster
+
+                # Apply soft-landing warmup weights for users who recently switched
+                effective_weight = weight.item()
+                warmup_adjustments = []
+                for user_idx in cluster_assignments[c]:
+                    warmup_counter = self.client_states[user_idx]['warmup_counter']
+                    if warmup_counter > 0:
+                        user_warmup_factor = compute_warmup_weight(1.0, warmup_counter, self.warmup_rounds)
+                        warmup_adjustments.append(user_warmup_factor)
+
+                # Average warmup factor for cluster (if any users are warming up)
+                if warmup_adjustments:
+                    avg_warmup = sum(warmup_adjustments) / len(warmup_adjustments)
+                    effective_weight *= avg_warmup
+
+                weighted_update += (effective_weight * cluster_update[key]) / num_users_in_cluster
             w_new[key] = w_global[key].float() + weighted_update
 
-        # Update q (queue state) - simple update based on trust
+        # Step 9: Decrement warmup counters
+        for user_idx in range(num_users):
+            if self.client_states[user_idx]['warmup_counter'] > 0:
+                self.client_states[user_idx]['warmup_counter'] -= 1
+
+        # Step 10: Update q (queue state) - simple update based on trust
         q_new = q.copy()
         for cluster_idx, cluster_users in enumerate(cluster_assignments):
             for user_idx in cluster_users:
@@ -522,13 +780,20 @@ class SketchedAirDefense:
                 else:
                     q_new[user_idx] = q_new[user_idx] + 0.1
 
+        # Store current assignments for next round comparison
+        self.prev_cluster_assignments = cluster_assignments
+
         # Prepare defense info for logging
         defense_info = {
             'trust_weights': trust_weights.cpu().detach().numpy(),
             'anomaly_scores': anomaly_scores.cpu().detach().numpy(),
-            'predictor_loss': predictor_loss,
+            'predictor_loss': predictor_loss_info['total'] if isinstance(predictor_loss_info, dict) else predictor_loss_info,
+            'predictor_loss_mse': predictor_loss_info.get('mse', 0.0) if isinstance(predictor_loss_info, dict) else 0.0,
+            'predictor_loss_adv': predictor_loss_info.get('adv', 0.0) if isinstance(predictor_loss_info, dict) else 0.0,
             'history_size': len(self.history_buffer),
-            'cluster_scaling': cluster_scaling
+            'cluster_scaling': cluster_scaling,
+            'cluster_switches': len(cluster_switches),  # Number of switches this round
+            'warmup_users': sum(1 for u in self.client_states.values() if u['warmup_counter'] > 0)
         }
 
         return w_new, reputation, q_new, defense_info
