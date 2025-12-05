@@ -20,7 +20,7 @@ def FedAvg(w, args):
 def FedAvg_Byzantine(w, args, P, wt, G, j, Hh):
     w_avg = copy.deepcopy(w[0])
     B = 1e+6
-    N0 = 1e-7
+    N0 = 0 #1e-7
     q = np.zeros((args.num_users-1,1))
     K = args.num_users-1
     gamma, phi = calculate_Phi(w, args, q, wt)

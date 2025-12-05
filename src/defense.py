@@ -9,6 +9,9 @@ import numpy as np
 import copy
 from collections import deque
 
+# Import adaptive attacks (lazy import to avoid circular dependency)
+ADAPTIVE_ATTACKS = ['null_space', 'slow_poison', 'predictor_proxy']
+
 
 def get_model_flattened_dim(net):
     """
@@ -200,7 +203,7 @@ def defense_aware_loss(model, history_batch, true_target, lambda_adv=0.5, device
     """
     # 1. Normal prediction loss (MSE)
     pred_normal = model(history_batch)
-    loss_mse = F.mse_loss(pred_normal, true_target)
+    loss_mse = F.mse_loss(pred_normal, true_target.detach())  # [FIX] Detach target to prevent gradient leakage
 
     # 2. Generate simulated "slow-poisoning" attack samples
     # Attack method: Add small linear drift to history trajectory
@@ -227,7 +230,7 @@ def defense_aware_loss(model, history_batch, true_target, lambda_adv=0.5, device
     # When real attack happens, prediction stays normal but received signal drifts
     # -> Large gap -> Anomaly detected!
     pred_adv = model(adv_history)
-    loss_adv = F.mse_loss(pred_adv, true_target)
+    loss_adv = F.mse_loss(pred_adv, true_target.detach())  # [FIX] Detach target
 
     # Total loss: accuracy + robustness
     total_loss = loss_mse + lambda_adv * loss_adv
@@ -240,10 +243,9 @@ def handle_cluster_switch(client_id, old_cluster_id, new_cluster_id,
     """
     Handle client switching from one cluster to another.
 
-    Implements state inheritance and soft-landing mechanism:
-    1. State Reset: Client discards its own history
-    2. State Inherit: Client inherits new cluster's centroid history
-    3. Soft-Landing: Client has reduced weight for warmup_rounds
+    Implements soft-landing mechanism for cluster transitions.
+    Note: The predictor runs on the Server side using cluster-level history (self.history_buffer),
+    not client-level history. So we only track warmup counters here.
 
     Args:
         client_id: ID of the client switching clusters
@@ -252,20 +254,19 @@ def handle_cluster_switch(client_id, old_cluster_id, new_cluster_id,
         cluster_states: Dictionary tracking each cluster's state
             {cluster_id: {'centroid_history': tensor, 'members': set}}
         client_states: Dictionary tracking each client's state
-            {client_id: {'history': tensor, 'warmup_counter': int, 'cluster_id': int}}
+            {client_id: {'warmup_counter': int, 'cluster_id': int}}
         warmup_rounds: Number of rounds for soft-landing (default 3)
     """
-    # 1. Inherit new cluster's history state
-    if new_cluster_id in cluster_states and 'centroid_history' in cluster_states[new_cluster_id]:
-        client_states[client_id]['history'] = cluster_states[new_cluster_id]['centroid_history'].clone()
+    # [FIX] Removed dead code: client_states[client_id]['history'] assignment
+    # The predictor uses Server-side cluster-level history, not client-level history
 
-    # 2. Set warmup flag for soft-landing
+    # 1. Set warmup flag for soft-landing
     client_states[client_id]['warmup_counter'] = warmup_rounds
 
-    # 3. Update cluster membership
+    # 2. Update cluster membership
     client_states[client_id]['cluster_id'] = new_cluster_id
 
-    # 4. Update cluster member sets
+    # 3. Update cluster member sets
     if old_cluster_id in cluster_states:
         cluster_states[old_cluster_id]['members'].discard(client_id)
     if new_cluster_id not in cluster_states:
@@ -370,7 +371,7 @@ class SketchedAirDefense:
 
         # Physical layer parameters
         self.B = 1e+6  # Bandwidth
-        self.N0 = 1e-7  # Noise power spectral density
+        self.N0 = 0 # Noise power spectral density
 
         # Defense-aware training parameters
         self.lambda_adv = getattr(args, 'lambda_adv', 0.5)  # Adversarial loss weight
@@ -422,6 +423,9 @@ class SketchedAirDefense:
         # Previous cluster assignments for detecting switches
         self.prev_cluster_assignments = None
 
+        # Attack state for adaptive attacks (persistent across rounds)
+        self.attack_state = {}
+
     def get_cluster_assignments(self, num_users, round_idx):
         """
         Assign users to clusters. Currently using sequential assignment.
@@ -463,9 +467,11 @@ class SketchedAirDefense:
         Returns:
             cluster_updates: List of aggregated updates for each cluster (with noise)
             cluster_scaling: Scaling factors for each cluster
+            real_participating_counts: [FIX] Actual number of users participating per cluster
         """
         cluster_updates = []
         cluster_scaling = []
+        real_participating_counts = []  # [FIX] Track actual participating users per cluster
 
         for cluster_idx, cluster_users in enumerate(cluster_assignments):
             # Initialize cluster aggregate
@@ -485,6 +491,9 @@ class SketchedAirDefense:
             if min_h == float('inf'):
                 min_h = 1.0  # Fallback
 
+            # [FIX] Counter for actual participating users
+            participating_count = 0
+
             # Compute channel-scaled aggregation
             for user_idx in cluster_users:
                 # Compute update: w_local - w_global
@@ -500,11 +509,18 @@ class SketchedAirDefense:
                 # FIX Bug 1: 简化的 AirComp 模拟 (Perfect Power Control Assumption)
                 # 移除除法操作，假设预编码已经抵消了信道差异，直接叠加
                 if H[user_idx][round_idx] > 0.1:  # 仅当信道足够好时才参与
+                    participating_count += 1  # [FIX] Count actual participants
                     for key in cluster_agg.keys():
                         cluster_agg[key] += user_update[key]  # 直接叠加
 
+            # [FIX] Prevent division by zero (if all users dropped, set to 1)
+            real_participating_counts.append(max(1, participating_count))
+
             # Add AWGN noise (simulating over-the-air transmission)
-            noise_std = np.sqrt(self.B * self.N0 / 2) * self.args.lr / min_h
+            # [FIX] Remove lr dependency - noise power is a physical channel constant
+            # Noise power: P_noise = B * N0 (bandwidth * noise spectral density)
+            # noise_std = sqrt(P_noise / 2) / min_h (normalized by channel gain)
+            noise_std = np.sqrt(self.B * self.N0 / 2) / min_h
             for key in cluster_agg.keys():
                 noise = torch.randn_like(cluster_agg[key]) * noise_std
                 cluster_agg[key] = cluster_agg[key] + noise
@@ -512,20 +528,30 @@ class SketchedAirDefense:
             cluster_updates.append(cluster_agg)
             cluster_scaling.append(min_h)
 
-        return cluster_updates, cluster_scaling
+        return cluster_updates, cluster_scaling, real_participating_counts  # [FIX] Return counts
 
-    def extract_sketches(self, cluster_updates):
+    def extract_sketches(self, cluster_updates, cluster_sizes=None):
         """
         Extract sketches from cluster updates.
 
         Args:
             cluster_updates: List of cluster update dictionaries
+            cluster_sizes: List of cluster sizes for normalization (optional)
+                           [FIX] Added to prevent magnitude shift when cluster size changes
         Returns:
             sketches: Tensor [num_clusters, sketch_dim]
         """
         sketches = []
-        for update in cluster_updates:
+        for idx, update in enumerate(cluster_updates):
             flattened = flatten_model_updates(update, self.device)
+
+            # [FIX] Normalize by cluster size to prevent magnitude shift artifacts
+            # When cluster size changes (e.g., 10 -> 11 members), the summed gradient
+            # magnitude changes proportionally. This causes the predictor to see
+            # a sudden jump and incorrectly flag it as anomaly.
+            if cluster_sizes is not None and cluster_sizes[idx] > 0:
+                flattened = flattened / cluster_sizes[idx]
+
             sketch = self.sketcher.sketch(flattened)
             sketches.append(sketch)
 
@@ -656,6 +682,104 @@ class SketchedAirDefense:
 
         return updated_reputation
 
+    def apply_adaptive_attacks(self, w_locals, w_global, args):
+        """
+        Apply adaptive attacks to Byzantine users' local models.
+
+        Supports three adaptive attack types:
+        - null_space: Exploits null space of projection matrix
+        - slow_poison: Slow drift attack within predictor tolerance
+        - predictor_proxy: Uses local predictor to evade detection
+
+        Args:
+            w_locals: List of local model weights
+            w_global: Current global model weights
+            args: Command line arguments
+        Returns:
+            w_locals_attacked: Modified local weights with attacks applied
+        """
+        attack_type = args.attack
+
+        # Only process adaptive attacks
+        if attack_type not in ADAPTIVE_ATTACKS:
+            return w_locals
+
+        # Lazy import to avoid circular dependency
+        from .adaptive_attacks import (
+            NullSpaceAttack, SlowPoisoningAttack, PredictorProxyAttack
+        )
+
+        w_locals_attacked = copy.deepcopy(w_locals)
+        num_byz = args.num_byz
+
+        for user_idx in range(num_byz):
+            # Get benign gradient (flattened)
+            benign_flat = flatten_model_updates(
+                {k: w_locals[user_idx][k] - w_global[k] for k in sorted(w_global.keys())},
+                self.device
+            )
+
+            if attack_type == 'null_space':
+                # Initialize attacker if needed
+                if 'null_space' not in self.attack_state:
+                    self.attack_state['null_space'] = NullSpaceAttack(
+                        self.sketcher.S,
+                        device=self.device,
+                        attack_strength=getattr(args, 'attack_strength', 1.0)
+                    )
+                attacker = self.attack_state['null_space']
+                poisoned_flat = attacker.generate_poison(benign_flat)
+
+            elif attack_type == 'slow_poison':
+                # Initialize attacker if needed
+                if 'slow_poison' not in self.attack_state:
+                    self.attack_state['slow_poison'] = SlowPoisoningAttack(
+                        target_direction=None,
+                        alpha=getattr(args, 'poison_alpha', 0.05),
+                        decay_rate=getattr(args, 'poison_decay', 0.99),
+                        device=self.device
+                    )
+                attacker = self.attack_state['slow_poison']
+                poisoned_flat = attacker.generate_poison(benign_flat)
+
+            elif attack_type == 'predictor_proxy':
+                # Initialize attacker if needed
+                if 'predictor_proxy' not in self.attack_state:
+                    self.attack_state['predictor_proxy'] = PredictorProxyAttack(
+                        sketch_dim=self.sketch_dim,
+                        hidden_dim=getattr(args, 'proxy_hidden', 64),
+                        window_size=self.window_size,
+                        threshold_margin=getattr(args, 'threshold_margin', 0.1),
+                        device=self.device
+                    )
+                attacker = self.attack_state['predictor_proxy']
+
+                # Feed history to attacker's local predictor
+                if len(self.history_buffer) >= self.window_size:
+                    for sketch in self.history_buffer:
+                        attacker.observe_sketch(sketch[0])  # Use first cluster's sketch
+                    attacker.train_local_predictor(num_steps=3)
+
+                    history_tensor = torch.stack(list(self.history_buffer)[-self.window_size:])
+                    # Use mean across clusters for history
+                    history_mean = history_tensor.mean(dim=1)
+                    poisoned_flat = attacker.generate_poison(
+                        benign_flat, self.sketcher, history_mean
+                    )
+                else:
+                    # Not enough history, use simple negative attack
+                    poisoned_flat = -benign_flat
+
+            # Convert back to state_dict format
+            poisoned_update = unflatten_model_updates(poisoned_flat, w_global, self.device)
+
+            # Apply poisoned update to get new local model
+            for key in sorted(w_global.keys()):
+                w_locals_attacked[user_idx][key] = w_global[key].float() + poisoned_update[key]
+
+        return w_locals_attacked
+
+
     def aggregate_with_defense(self, w_locals, w_global, args, round_idx,
                                 P, G, H, reputation, q):
         """
@@ -688,7 +812,7 @@ class SketchedAirDefense:
         if len(self.client_states) == 0:
             for user_idx in range(num_users):
                 self.client_states[user_idx] = {
-                    'history': None,
+                    # [FIX] Removed 'history' field - predictor uses cluster-level history
                     'warmup_counter': 0,
                     'cluster_id': -1  # Will be set during assignment
                 }
@@ -716,13 +840,21 @@ class SketchedAirDefense:
                         self.cluster_states[cluster_idx] = {'members': set(), 'centroid_history': None}
                     self.cluster_states[cluster_idx]['members'].add(user_idx)
 
+        # Step 1.8: Apply adaptive attacks to Byzantine users (if using adaptive attack)
+        # This modifies w_locals for Byzantine users before aggregation
+        if args.attack in ADAPTIVE_ATTACKS:
+            w_locals = self.apply_adaptive_attacks(w_locals, w_global, args)
+
         # Step 2: Compute cluster updates with AirComp physical layer simulation
-        cluster_updates, cluster_scaling = self.compute_cluster_updates_with_aircomp(
+        # [FIX] Now also returns real_participating_counts for dynamic normalization
+        cluster_updates, cluster_scaling, real_participating_counts = self.compute_cluster_updates_with_aircomp(
             w_locals, w_global, cluster_assignments, P, G, H, round_idx
         )
 
-        # Step 3: Extract sketches
-        current_sketches = self.extract_sketches(cluster_updates)
+        # Step 3: Extract sketches (with DYNAMIC cluster size normalization)
+        # [FIX] Use real_participating_counts instead of static len(cluster_assignments[c])
+        # This prevents false anomaly detection when users drop out due to bad channels
+        current_sketches = self.extract_sketches(cluster_updates, real_participating_counts)
 
         # Step 3.5: Update cluster centroid histories
         for cluster_idx in range(self.num_clusters):
@@ -743,11 +875,16 @@ class SketchedAirDefense:
         reputation = self.update_reputation(reputation, trust_weights, cluster_assignments)
 
         # Step 8: Weighted aggregation with soft-landing adjustment
+        # [FIX] Use real_participating_counts for normalization:
+        # 1. cluster_update is SUM of ACTUAL participating user updates (from AirComp)
+        # 2. Divide by real_participating_counts[c] to get AVERAGE update
+        # 3. Apply trust_weight for defense-aware weighting
         w_new = copy.deepcopy(w_global)
         for key in sorted(w_new.keys()):
             weighted_update = torch.zeros_like(w_new[key], dtype=torch.float32).to(self.device)
             for c, (cluster_update, weight) in enumerate(zip(cluster_updates, trust_weights)):
-                num_users_in_cluster = len(cluster_assignments[c])
+                # [FIX] Use dynamic count instead of static cluster size
+                num_users_in_cluster = real_participating_counts[c]
 
                 # Apply soft-landing warmup weights for users who recently switched
                 effective_weight = weight.item()

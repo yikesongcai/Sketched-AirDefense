@@ -41,8 +41,21 @@ def args_parser():
     parser.add_argument('--num_cluster', type=int, default=8, help="number of clusters")
     parser.add_argument('--optw', type=str, default='opt', help="weight adaptive")
     parser.add_argument('--clustering', type=str, default='seq', help="clustering")
-    parser.add_argument('--attack', type=str, default='omni', help="attack")
+    parser.add_argument('--attack', type=str, default='omni',
+                        help="attack type: omni, gaussian, label, null_space, slow_poison, predictor_proxy")
     parser.add_argument('--V', type=float, default=1e3, help="Lyapunov")
+
+    # Adaptive attack parameters (for null_space, slow_poison, predictor_proxy)
+    parser.add_argument('--attack_strength', type=float, default=1.0,
+                        help="attack strength for null_space attack (gamma)")
+    parser.add_argument('--poison_alpha', type=float, default=0.05,
+                        help="interpolation factor for slow_poison attack")
+    parser.add_argument('--poison_decay', type=float, default=0.99,
+                        help="decay rate for slow_poison alpha over time")
+    parser.add_argument('--proxy_hidden', type=int, default=64,
+                        help="hidden dimension for predictor_proxy local LSTM")
+    parser.add_argument('--threshold_margin', type=float, default=0.1,
+                        help="safety margin for predictor_proxy attack (delta)")
 
     # Sketched-AirDefense arguments
     parser.add_argument('--sketch_dim', type=int, default=128, help="dimension of gradient sketch")
@@ -55,7 +68,7 @@ def args_parser():
     # Defense-aware predictor arguments (new)
     parser.add_argument('--lambda_adv', type=float, default=0.5, help="weight for adversarial loss in defense-aware training")
     parser.add_argument('--warmup_rounds', type=int, default=3, help="soft-landing warmup rounds after cluster switch")
-    parser.add_argument('--use_defense_aware', action='store_true', default=True, help="use defense-aware LSTM predictor instead of GRU")
+    parser.add_argument('--use_defense_aware', action='store_true', default=False, help="use defense-aware LSTM predictor instead of GRU")
 
 
     args = parser.parse_args()
