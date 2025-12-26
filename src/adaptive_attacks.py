@@ -19,58 +19,74 @@ import numpy as np
 import copy
 
 
-def compute_null_space_projector(S, device='cuda', regularization=1e-6):
+def project_to_null_space(v, S, SST_inv, device='cuda'):
     """
-    Compute the null space projection matrix for a given projection matrix S.
+    Project vector v onto the null space of S WITHOUT computing the full d×d matrix.
 
     Mathematical Background:
-    - For a matrix S ∈ R^{m×d} where m < d, there exists a null space
-    - Null space contains vectors v where S·v = 0
-    - Projection onto null space: P_null = I - S^T (S S^T)^{-1} S
+    Instead of computing P_null = I - S^T (S S^T)^{-1} S (which is d×d and causes OOM),
+    we directly compute P_null · v using associativity:
+
+    P_null · v = (I - S^T (S S^T)^{-1} S) · v
+              = v - S^T · ((S S^T)^{-1} · (S · v))
+
+    This reduces complexity from O(d²) to O(kd) where k is sketch dimension.
+    Memory usage: Only need to store k×k matrix (S S^T)^{-1}, not d×d matrix.
 
     Args:
-        S: Projection matrix [sketch_dim, input_dim] or [input_dim, sketch_dim]
+        v: Input vector to project [d]
+        S: Projection matrix [k, d] where k << d (k is sketch_dim)
+        SST_inv: Precomputed (S S^T)^{-1} matrix [k, k]
+        device: torch device
+    Returns:
+        projected: v projected onto null space of S [d]
+    """
+    v = v.float().to(device)
+
+    # Step 1: Compute sketch of v: S · v -> [k]
+    Sv = torch.mv(S, v)
+
+    # Step 2: Compute (S S^T)^{-1} · (S · v) -> [k]
+    SST_inv_Sv = torch.mv(SST_inv, Sv)
+
+    # Step 3: Compute S^T · ((S S^T)^{-1} · (S · v)) -> [d]
+    ST_SST_inv_Sv = torch.mv(S.T, SST_inv_Sv)
+
+    # Step 4: P_null · v = v - S^T · ((S S^T)^{-1} · (S · v))
+    projected = v - ST_SST_inv_Sv
+
+    return projected
+
+
+def precompute_SST_inv(S, device='cuda', regularization=1e-6):
+    """
+    Precompute (S S^T)^{-1} for efficient null space projection.
+
+    This is a small k×k matrix (e.g., 256×256) that can be stored in memory.
+
+    Args:
+        S: Projection matrix [k, d] or [d, k]
         device: torch device
         regularization: Small value for numerical stability
     Returns:
-        P_null: Null space projection matrix [input_dim, input_dim]
+        S_normalized: S in shape [k, d]
+        SST_inv: (S S^T + λI)^{-1} matrix [k, k]
     """
     S = S.float().to(device)
 
-    # Ensure S is in shape [m, d] where m < d (rows are projection directions)
+    # Ensure S is in shape [k, d] where k < d (rows are projection directions)
     if S.shape[0] > S.shape[1]:
-        S = S.T  # Transpose if needed
+        S = S.T  # Transpose to [k, d]
 
-    m, d = S.shape
+    k, d = S.shape
 
-    # For large matrices, use pseudo-inverse for memory efficiency
-    # P_null = I - S^T (S S^T + λI)^{-1} S
-    try:
-        # Compute S S^T + regularization * I for stability
-        SST = torch.mm(S, S.T) + regularization * torch.eye(m, device=device)
+    # Compute S S^T + regularization * I for numerical stability
+    SST = torch.mm(S, S.T) + regularization * torch.eye(k, device=device)
 
-        # Compute (S S^T)^{-1}
-        SST_inv = torch.inverse(SST)
+    # Compute (S S^T)^{-1} - this is only k×k, very small!
+    SST_inv = torch.inverse(SST)
 
-        # Compute S^T (S S^T)^{-1} S
-        projection_onto_row_space = torch.mm(torch.mm(S.T, SST_inv), S)
-
-        # Null space projector = I - projection onto row space
-        P_null = torch.eye(d, device=device) - projection_onto_row_space
-
-    except RuntimeError:
-        # Fallback: Use SVD for more stable computation
-        # This is slower but works for ill-conditioned matrices
-        U, singular_values, Vh = torch.linalg.svd(S, full_matrices=True)
-
-        # Null space is spanned by right singular vectors corresponding to zero singular values
-        rank = torch.sum(singular_values > 1e-10).item()
-        null_space_basis = Vh[rank:, :].T  # [d, d-rank]
-
-        # P_null = V_null @ V_null^T
-        P_null = torch.mm(null_space_basis, null_space_basis.T)
-
-    return P_null
+    return S, SST_inv
 
 
 class NullSpaceAttack:
@@ -87,6 +103,11 @@ class NullSpaceAttack:
     - Server sees: S·g_attack = S·g_benign (unchanged sketch!)
     - But model receives the full poisoned gradient
 
+    Memory-Efficient Implementation:
+    - Does NOT store the d×d null space projector matrix
+    - Only stores k×k matrix (S S^T)^{-1} where k is sketch_dim (e.g., 256)
+    - Projects vectors on-the-fly using: P_null·v = v - S^T((SS^T)^{-1}(Sv))
+
     Defense Implications:
     - Tests if dynamic S matrices or channel noise can disrupt null space
     - Reveals theoretical limits of sketch-based detection
@@ -102,11 +123,14 @@ class NullSpaceAttack:
         self.device = device
         self.attack_strength = attack_strength
 
-        # Precompute null space projector (expensive, do once)
-        self.P_null = compute_null_space_projector(projection_matrix_S, device)
+        # Precompute (S S^T)^{-1} - only k×k matrix, memory efficient!
+        # This replaces the old d×d P_null matrix that caused OOM
+        self.S, self.SST_inv = precompute_SST_inv(projection_matrix_S, device)
 
-        # Store for verification
-        self.S = projection_matrix_S.to(device)
+        # Log memory savings
+        k, d = self.S.shape
+        print(f"[NullSpaceAttack] Memory-efficient init: storing {k}x{k} matrix instead of {d}x{d}")
+        print(f"[NullSpaceAttack] Memory saved: {(d*d - k*k) * 4 / 1e9:.2f} GB")
 
     def generate_poison(self, benign_gradient, malicious_target=None):
         """
@@ -127,9 +151,11 @@ class NullSpaceAttack:
         else:
             malicious_target = malicious_target.float().to(self.device)
 
-        # Project malicious gradient onto null space
-        # This ensures S·(P_null·g_mal) ≈ 0
-        null_space_poison = torch.mv(self.P_null, malicious_target)
+        # Project malicious gradient onto null space using memory-efficient method
+        # This computes P_null · g_mal WITHOUT storing the d×d matrix
+        null_space_poison = project_to_null_space(
+            malicious_target, self.S, self.SST_inv, self.device
+        )
 
         # Scale the poison
         poisoned_gradient = benign_gradient + self.attack_strength * null_space_poison
@@ -142,8 +168,9 @@ class NullSpaceAttack:
         Returns the relative difference in sketches.
         """
         with torch.no_grad():
-            sketch_benign = torch.mv(self.S.T, benign_gradient)
-            sketch_poisoned = torch.mv(self.S.T, poisoned_gradient)
+            # S is [k, d], so sketch = S · gradient
+            sketch_benign = torch.mv(self.S, benign_gradient.float().to(self.device))
+            sketch_poisoned = torch.mv(self.S, poisoned_gradient.float().to(self.device))
 
             diff = torch.norm(sketch_poisoned - sketch_benign)
             base = torch.norm(sketch_benign) + 1e-8
@@ -223,6 +250,40 @@ class SlowPoisoningAttack:
         drift = torch.norm(poisoned_gradient - benign_gradient).item()
         self.cumulative_drift += drift
         self.round_count += 1
+
+        return poisoned_gradient
+
+    def _generate_poison_no_count(self, benign_gradient, target_direction=None):
+        """
+        Generate slowly drifting poisoned gradient WITHOUT incrementing round count.
+        Used when round counting is managed externally.
+
+        Args:
+            benign_gradient: Honest gradient from local training [d]
+            target_direction: Optional override for target direction
+        Returns:
+            poisoned_gradient: (1-α)·g_benign + α·g_target
+        """
+        benign_gradient = benign_gradient.float().to(self.device)
+
+        # Use provided target or stored target
+        target = target_direction if target_direction is not None else self.target_direction
+        if target is None:
+            # Default: opposite direction (omniscient attack)
+            target = -benign_gradient
+        else:
+            target = target.float().to(self.device)
+
+        # Normalize target to match benign gradient magnitude
+        target_normalized = target * (torch.norm(benign_gradient) / (torch.norm(target) + 1e-8))
+
+        # Interpolate: slow drift toward target (use current round_count, don't increment)
+        current_alpha = self.alpha * (self.decay_rate ** self.round_count)
+        poisoned_gradient = (1 - current_alpha) * benign_gradient + current_alpha * target_normalized
+
+        # Track cumulative effect
+        drift = torch.norm(poisoned_gradient - benign_gradient).item()
+        self.cumulative_drift += drift
 
         return poisoned_gradient
 
@@ -453,28 +514,29 @@ class PredictorProxyAttack:
             self.estimated_threshold = (max(undetected_scores) + min(detected_scores)) / 2
 
 
-def apply_adaptive_attack(attack_type, benign_update, w_global, args,
-                          sketcher=None, history=None, attack_state=None, device='cuda'):
+def apply_adaptive_attack(benign_update, w_global, args, user_idx, attack_state,
+                          sketcher=None, history=None, device='cuda'):
     """
     Unified interface to apply adaptive attacks.
 
-    This function is called from defense.py to apply the selected attack type
+    This function is called from strategy.py to apply the selected attack type
     to Byzantine users' gradients.
 
     Args:
-        attack_type: One of ['null_space', 'slow_poison', 'predictor_proxy']
         benign_update: The honest local update (state_dict format)
         w_global: Current global model weights
-        args: Command line arguments
+        args: Command line arguments (attack type from args.attack)
+        user_idx: Index of the Byzantine user (for per-user state)
+        attack_state: Persistent attack state dict (for stateful attacks)
         sketcher: GradientSketcher instance (needed for some attacks)
         history: Sketch history buffer (needed for predictor_proxy)
-        attack_state: Persistent attack state (for stateful attacks)
         device: torch device
     Returns:
         poisoned_update: Modified update dictionary
-        attack_state: Updated attack state (for next round)
     """
-    from .defense import flatten_model_updates, unflatten_model_updates
+    from .model_utils import unflatten_model_updates
+
+    attack_type = args.attack
 
     # Flatten the update for processing
     update_flat = []
@@ -489,7 +551,7 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
 
     # Apply selected attack
     if attack_type == 'null_space':
-        # Initialize NullSpaceAttack if not exists
+        # Initialize NullSpaceAttack if not exists (shared across all Byzantine users)
         if 'null_space_attacker' not in attack_state:
             if sketcher is None:
                 raise ValueError("NullSpaceAttack requires sketcher")
@@ -502,7 +564,7 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
         poisoned_gradient = attacker.generate_poison(benign_gradient)
 
     elif attack_type == 'slow_poison':
-        # Initialize SlowPoisoningAttack if not exists
+        # Initialize SlowPoisoningAttack - use shared instance with round tracking
         if 'slow_poison_attacker' not in attack_state:
             attack_state['slow_poison_attacker'] = SlowPoisoningAttack(
                 target_direction=None,  # Will use -benign as default
@@ -510,9 +572,22 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
                 decay_rate=getattr(args, 'poison_decay', 0.99),
                 device=device
             )
+            attack_state['slow_poison_round'] = 0
+            attack_state['slow_poison_users_processed'] = 0
 
         attacker = attack_state['slow_poison_attacker']
-        poisoned_gradient = attacker.generate_poison(benign_gradient)
+
+        # Track round count correctly: only increment once per round, not per user
+        attack_state['slow_poison_users_processed'] += 1
+        if attack_state['slow_poison_users_processed'] >= args.num_byz:
+            # All Byzantine users processed for this round
+            attack_state['slow_poison_round'] += 1
+            attack_state['slow_poison_users_processed'] = 0
+            # Manually set round_count to avoid incrementing in generate_poison
+            attacker.round_count = attack_state['slow_poison_round']
+
+        # Generate poison without incrementing internal counter
+        poisoned_gradient = attacker._generate_poison_no_count(benign_gradient)
 
     elif attack_type == 'predictor_proxy':
         # Initialize PredictorProxyAttack if not exists
@@ -526,16 +601,20 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
                 threshold_margin=getattr(args, 'threshold_margin', 0.1),
                 device=device
             )
+            attack_state['proxy_history_observed'] = False
 
         attacker = attack_state['proxy_attacker']
 
-        # Train local predictor on observed history
-        if history is not None and len(history) > 0:
-            for sketch in history:
-                attacker.observe_sketch(sketch)
+        # Only observe history once per round (not per user)
+        if history is not None and len(history) > 0 and not attack_state['proxy_history_observed']:
+            # Get only the latest sketch (not the entire history repeatedly)
+            latest_sketch = list(history)[-1]
+            attacker.observe_sketch(latest_sketch)
             attacker.train_local_predictor(num_steps=5)
+            attack_state['proxy_history_observed'] = True
 
-            # Generate attack
+        # Generate attack
+        if history is not None and len(history) >= args.window_size:
             history_tensor = torch.stack(list(history)[-args.window_size:])
             poisoned_gradient = attacker.generate_poison(
                 benign_gradient, sketcher, history_tensor
@@ -543,6 +622,11 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
         else:
             # Not enough history, fall back to simple attack
             poisoned_gradient = -benign_gradient
+
+        # Reset flag for next round (will be set True again when first user is processed)
+        if user_idx == args.num_byz - 1:
+            attack_state['proxy_history_observed'] = False
+
     else:
         raise ValueError(f"Unknown attack type: {attack_type}")
 
@@ -558,4 +642,4 @@ def apply_adaptive_attack(attack_type, benign_update, w_global, args,
         ).to(device)
         idx += numel
 
-    return poisoned_update, attack_state
+    return poisoned_update

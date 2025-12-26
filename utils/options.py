@@ -40,7 +40,7 @@ def args_parser():
     parser.add_argument('--num_byz', type=int, default=6, help="number of Byzantine")
     parser.add_argument('--num_cluster', type=int, default=8, help="number of clusters")
     parser.add_argument('--optw', type=str, default='opt', help="weight adaptive")
-    parser.add_argument('--clustering', type=str, default='seq', help="clustering")
+    parser.add_argument('--clustering', type=str, default='location', help="clustering")
     parser.add_argument('--attack', type=str, default='omni',
                         help="attack type: omni, gaussian, label, null_space, slow_poison, predictor_proxy")
     parser.add_argument('--V', type=float, default=1e3, help="Lyapunov")

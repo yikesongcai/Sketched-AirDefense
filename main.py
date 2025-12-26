@@ -1,13 +1,13 @@
 import torch
 from torchvision import datasets, transforms
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 import copy
 import numpy as np
 import random
 from tqdm import trange
 import matplotlib.pyplot as plt
-
+from collections import deque
 
 from utils.distribute import uniform_distribute, train_dg_split
 from utils.sampling import iid, noniid
@@ -17,9 +17,13 @@ from src.nets import MLP, CNN_v1, CNN_v2
 from src.strategy import FedAvg, FedAvg_Byzantine, Secure_aggregation
 from src.test import test_img, test_ind_img
 from src.generate import generate_clients
-from src.defense import SketchedAirDefense, get_model_flattened_dim, Sketched_Defense_Aggregation
+from src.defense import (
+    SketchedAirDefense, get_model_flattened_dim, Sketched_Defense_Aggregation,
+    GradientSketcher, flatten_model_updates,
+)
+from src.client import Client, MaliciousClient
 
-writer = SummaryWriter()
+# writer = SummaryWriter()
 
 if __name__ == '__main__':
     # parse args
@@ -118,15 +122,31 @@ if __name__ == '__main__':
     print(net_glob)
     net_glob.train()
 
-    # Initialize Sketched-AirDefense if enabled
+    # Initialize defense / attack utilities
     defense_module = None
+    attack_state = {}
+    model_dim = get_model_flattened_dim(net_glob)
+    sketcher = None
+    history_buffer = None
+
     if args.defense_method == 'sketched':
-        model_dim = get_model_flattened_dim(net_glob)
         print(f"[Sketched-AirDefense] Model dimension: {model_dim}")
         print(f"[Sketched-AirDefense] Sketch dimension: {args.sketch_dim}")
         print(f"[Sketched-AirDefense] Window size: {args.window_size}")
         print(f"[Sketched-AirDefense] Number of clusters: {args.num_cluster}")
+        print(f"[Sketched-AirDefense] Clustering method: {args.clustering}")
         defense_module = SketchedAirDefense(args, model_dim, args.device)
+        # For sketched defense, the defense module contains its own sketcher
+        sketcher = defense_module.sketcher
+        history_buffer = defense_module.history_buffer 
+        # Note: SketchedAirDefense uses per-cluster history, but history_buffer here is used by malicious clients
+        # to observe the global state. 
+        # If we use Sketched defense, the 'state' observed by attackers might be the aggregated sketches.
+        
+    else:
+        # 为 byzantine / proposed 提供自适应攻击所需的草图器与历史缓存
+        sketcher = GradientSketcher(model_dim, args.sketch_dim, args.device)
+        history_buffer = deque(maxlen=args.window_size)
 
     # copy weights
     w_glob = net_glob.state_dict()
@@ -136,43 +156,62 @@ if __name__ == '__main__':
     w_glob, _ = initialization_stage.train(local_net = copy.deepcopy(net_glob).to(args.device), net = copy.deepcopy(net_glob).to(args.device))
     net_glob.load_state_dict(w_glob)
 
-    
-    w_locals = [w_glob for i in range(args.num_users)]
-    
-    num=0
-    
-   
-    
+    # Generate Channel Conditions
     distance, P, H, G = generate_clients(args)
     
+    # Pass distance to defense module for location-based clustering
+    if defense_module is not None:
+        defense_module.set_user_distances(distance)
     
-    wt =  net_glob.state_dict()
+    # Initialize Clients
+    clients = []
+    idxs_users = np.array(range(args.num_users)) # 0 to num_users-1
     
+    for idx in idxs_users:
+        data_size = int(sumdatasize * alph[idx])
+        
+        # Check if malicious
+        if idx <= args.num_byz - 1: # Users 0 to num_byz-1 are attackers
+            clients.append(MaliciousClient(
+                args=args,
+                dataset=dataset,
+                user_idx=idx,
+                dict_users=dict_users,
+                data_size=data_size,
+                p_val=P[idx],
+                channel_gain=G[:, :], # Pass full G matrix for simplicity, or we can index later
+                attack_state=attack_state,
+                sketcher=sketcher,
+                history_buffer=history_buffer
+            ))
+        else:
+            clients.append(Client(
+                args=args,
+                dataset=dataset,
+                user_idx=idx,
+                dict_users=dict_users,
+                data_size=data_size,
+                p_val=P[idx],
+                channel_gain=G[:, :]
+            ))
+            
+    num=0
+    wt = net_glob.state_dict()
     reputation = np.zeros(args.num_users-1)
     q = np.zeros(args.num_users-1)
     alpha = np.ones(args.num_users-1)/(args.num_users-1)
     
     for iter in trange(args.rounds):
-        
-        num += 1
-        idxs_users = np.array(range(args.num_users))
-            
 
-        for idx in idxs_users:
+        num += 1
+        prev_global = copy.deepcopy(wt)
+        
+        # Collect updates
+        w_locals = []
+        for client in clients:
+            w_local, loss = client.train(net_glob, num, w_glob)
+            w_locals.append(w_local)
             
-            flag = 1
-            if idx <= args.num_byz-1 and args.attack == 'label':
-                flag = 0
-            # Local update
-            local = ModelUpdate(args=args, dataset=dataset, idxs=set(list(dict_users[idx])), rnds=num, data_size=int(sumdatasize*alph[idx]), flag_byz=flag)
-            
-            w, loss = local.train(local_net = copy.deepcopy(net_glob).to(args.device), net = copy.deepcopy(net_glob).to(args.device))
-            
-            
-            w_locals[idx] = copy.deepcopy(w)
-              
-                
-                
         # update global weights
         defense_info = None
         if args.defense_method == 'sketched' and defense_module is not None:
@@ -182,24 +221,35 @@ if __name__ == '__main__':
                 P, G, H, reputation, q
             )
         elif args.trans == 'byzantine':
-            w_glob =  FedAvg_Byzantine(w_locals, args, P, wt, G, num-1, H)
+            w_glob = FedAvg_Byzantine(w_locals, args, P, wt, G, num-1, H)
         elif args.trans == 'proposed':
-            w_glob, reputation, q = Secure_aggregation(w_locals, args, idxs_users, distance, P,  wt, reputation, G, num-1, H, q)
+            w_glob, reputation, q = Secure_aggregation(w_locals, args, idxs_users, distance, P, wt, reputation, G, num-1, H, q)
         else:
             w_glob = FedAvg(w_locals, args)
-            
+
+        # 记录聚合后的全局更新供 predictor_proxy 攻击使用 (Update Global History)
+        # Note: If SketchedDefense is used, it updates its history internally inside Sketched_Defense_Aggregation.
+        # But if standard defense is used, we need to update history_buffer manually for the attackers to see.
         
+        if args.defense_method != 'sketched' and sketcher is not None and history_buffer is not None:
+             global_update_flat = flatten_model_updates(
+                {k: w_glob[k] - prev_global[k] for k in sorted(w_glob.keys())},
+                args.device
+             )
+             history_buffer.append(sketcher.sketch(global_update_flat))
+
         wt = copy.deepcopy(w_glob)
-        
+
         # copy weight to net_glob
         net_glob.load_state_dict(w_glob)
-        
+
         acc_test, loss_test = test_img(net_glob, dataset_test, args)
 
         acc_ind = []
-        for idx in idxs_users:
-            tmp = test_ind_img(net_glob, dataset, args, set(list(dict_users[idx])))
-            acc_ind.append(float(tmp))
+        # Testing individual accuracy (optional, can be slow)
+        # for idx in idxs_users:
+        #     tmp = test_ind_img(net_glob, dataset, args, set(list(dict_users[idx])))
+        #     acc_ind.append(float(tmp))
 
         if args.debug:
             print(f"Round: {iter}")
@@ -214,14 +264,15 @@ if __name__ == '__main__':
         
         # tensorboard
         if args.tsboard:
-            writer.add_scalar(f"Test accuracy:Share{args.dataset}, {args.fed}", acc_test, iter)
-            writer.add_scalar(f"Test loss:Share{args.dataset}, {args.fed}", loss_test, iter)
-            if defense_info is not None:
-                writer.add_scalar(f"Defense/predictor_loss", defense_info['predictor_loss'], iter)
-                for c, w in enumerate(defense_info['trust_weights']):
-                    writer.add_scalar(f"Defense/trust_weight_cluster_{c}", w, iter)
+            pass
+            # writer.add_scalar(f"Test accuracy:Share{args.dataset}, {args.fed}", acc_test, iter)
+            # writer.add_scalar(f"Test loss:Share{args.dataset}, {args.fed}", loss_test, iter)
+            # if defense_info is not None:
+            #     writer.add_scalar(f"Defense/predictor_loss", defense_info['predictor_loss'], iter)
+            #     for c, w in enumerate(defense_info['trust_weights']):
+            #         writer.add_scalar(f"Defense/trust_weight_cluster_{c}", w, iter)
     
     
     plt.plot(range(args.rounds),result_acc)
     plt.show()
-    writer.close()
+    # writer.close()

@@ -9,63 +9,13 @@ import numpy as np
 import copy
 from collections import deque
 
-# Import adaptive attacks (lazy import to avoid circular dependency)
+# Attack types that require special handling
 ADAPTIVE_ATTACKS = ['null_space', 'slow_poison', 'predictor_proxy']
+BASIC_ATTACKS = ['omni', 'gaussian']  # Traditional attacks that also need explicit handling
+ALL_SUPPORTED_ATTACKS = ADAPTIVE_ATTACKS + BASIC_ATTACKS
 
 
-def get_model_flattened_dim(net):
-    """
-    Calculate the total number of parameters in the model.
-
-    Args:
-        net: PyTorch model
-    Returns:
-        total_dim: Total number of parameters
-    """
-    total_dim = 0
-    for param in net.parameters():
-        total_dim += param.numel()
-    return total_dim
-
-
-def flatten_model_updates(w_update, device):
-    """
-    Flatten model update dictionary to a single vector.
-    IMPORTANT: Uses sorted keys to ensure deterministic order across environments.
-
-    Args:
-        w_update: Dictionary of model updates (state_dict format)
-        device: torch device
-    Returns:
-        flattened: Flattened tensor of all updates
-    """
-    flattened = []
-    # FIX: Use sorted keys to ensure deterministic order
-    for key in sorted(w_update.keys()):
-        flattened.append(w_update[key].view(-1).float())
-    return torch.cat(flattened).to(device)
-
-
-def unflatten_model_updates(flattened, reference_dict, device):
-    """
-    Unflatten a vector back to model update dictionary format.
-
-    Args:
-        flattened: Flattened tensor
-        reference_dict: Reference state_dict for shape information
-        device: torch device
-    Returns:
-        unflattened: Dictionary with same structure as reference_dict
-    """
-    unflattened = copy.deepcopy(reference_dict)
-    idx = 0
-    # FIX: Use sorted keys to ensure deterministic order
-    for key in sorted(reference_dict.keys()):
-        numel = reference_dict[key].numel()
-        shape = reference_dict[key].shape
-        unflattened[key] = flattened[idx:idx+numel].view(shape).to(device)
-        idx += numel
-    return unflattened
+from .model_utils import get_model_flattened_dim, flatten_model_updates, unflatten_model_updates
 
 
 class GradientSketcher:
@@ -313,23 +263,40 @@ def compute_anomaly_score(predicted_sketch, actual_sketch):
     return error
 
 
-def compute_trust_weights(anomaly_scores, method='softmax', threshold=0.2):
+def compute_trust_weights(anomaly_scores, method='softmax', threshold=0.2, temperature=2.0):
+    """
+    Compute trust weights from anomaly scores.
+    
+    Args:
+        anomaly_scores: Tensor of anomaly scores [num_clusters]
+        method: 'softmax' or 'threshold'
+        threshold: For threshold method, top percentage to filter
+        temperature: For softmax, controls sensitivity (higher = more uniform)
+    Returns:
+        weights: Trust weights [num_clusters]
+    """
     num_clusters = len(anomaly_scores)
 
     if method == 'softmax':
-        # --- FIX START: Normalize scores to prevent softmax saturation ---
-        # 1. 减去最小值防止数值过大
+        # Normalize scores to prevent numerical issues
         scores = anomaly_scores - anomaly_scores.min()
-        # 2. 缩放到一定范围 (例如 0-10)，防止差异过大导致 one-hot
+        
+        # Use temperature scaling: higher temperature -> more uniform distribution
+        # Temperature of 2.0 means we need 2x the score difference to get the same weight ratio
         if scores.max() > 0:
-            scores = scores / scores.max() * 5.0  # Temperature scaling
-
+            # Scale to reasonable range, then apply temperature
+            scores = scores / scores.max() * temperature
+        
         # Softmax of negative scores: lower anomaly -> higher weight
         weights = F.softmax(-scores, dim=0)
-        # --- FIX END ---
+        
+        # [FIX] Apply minimum weight floor to prevent any cluster from being completely ignored
+        # This is important when there are no attackers - all clusters should contribute
+        min_weight = 0.5 / num_clusters  # At least half of uniform weight
+        weights = torch.clamp(weights, min=min_weight)
+        weights = weights / weights.sum()  # Re-normalize
 
     elif method == 'threshold':
-        # ... (保持原有逻辑)
         k = max(1, int(num_clusters * threshold))
         _, top_indices = torch.topk(anomaly_scores, k)
         weights = torch.ones(num_clusters, device=anomaly_scores.device)
@@ -371,7 +338,7 @@ class SketchedAirDefense:
 
         # Physical layer parameters
         self.B = 1e+6  # Bandwidth
-        self.N0 = 0 # Noise power spectral density
+        self.N0 = 1e-7 # Noise power spectral density
 
         # Defense-aware training parameters
         self.lambda_adv = getattr(args, 'lambda_adv', 0.5)  # Adversarial loss weight
@@ -426,23 +393,53 @@ class SketchedAirDefense:
         # Attack state for adaptive attacks (persistent across rounds)
         self.attack_state = {}
 
-    def get_cluster_assignments(self, num_users, round_idx):
+    def set_user_distances(self, distance):
         """
-        Assign users to clusters. Currently using sequential assignment.
+        Set user distances for location-based clustering.
+        Should be called after generate_clients() in main.py.
+        
+        Args:
+            distance: Array of distances for each user [num_users]
+        """
+        self.user_distances = distance[:-1]  # Exclude server (last user)
+    
+    def get_cluster_assignments(self, num_users, round_idx, method=None):
+        """
+        Assign users to clusters using specified method.
 
         Args:
-            num_users: Number of users (excluding server)
+            num_users: Number of users (including server)
             round_idx: Current round index
+            method: Clustering method - 'sequential', 'random', 'location', or None (uses args.clustering)
         Returns:
             cluster_assignments: List of lists, each inner list contains user indices for a cluster
         """
         K = num_users - 1  # Exclude server (last user)
         num_per_cluster = K // self.num_clusters
 
-        cluster_assignments = []
+        # Determine clustering method
+        if method is None:
+            method = getattr(self.args, 'clustering', 'sequential')
+        
         indices = list(range(K))
-
-        # Sequential assignment (can be extended to other methods)
+        
+        if method == 'random':
+            # Random shuffle
+            np.random.shuffle(indices)
+            
+        elif method == 'location':
+            # Sort by distance from base station (closer users first)
+            if hasattr(self, 'user_distances') and self.user_distances is not None:
+                indices = sorted(indices, key=lambda i: self.user_distances[i])
+            else:
+                print("[Warning] Location clustering requested but distances not set. Using sequential.")
+                
+        elif method == 'sequential':
+            # Keep original order (indices already in order)
+            pass
+        
+        # Assign sorted/shuffled indices to clusters
+        cluster_assignments = []
         for c in range(self.num_clusters):
             start_idx = c * num_per_cluster
             end_idx = start_idx + num_per_cluster if c < self.num_clusters - 1 else K
@@ -472,6 +469,18 @@ class SketchedAirDefense:
         cluster_updates = []
         cluster_scaling = []
         real_participating_counts = []  # [FIX] Track actual participating users per cluster
+        
+        # Step 1: Compute gamma (gradient norm squared) for all users - same as FedSAC
+        K = self.args.num_users - 1
+        gamma = np.zeros((K, 1))
+        for user_idx in range(K):
+            for key in sorted(w_global.keys()):
+                tmp = w_locals[user_idx][key].float() - w_global[key].float()
+                tmp_np = tmp.cpu().numpy()
+                gamma[user_idx][0] += (np.linalg.norm(tmp_np)) ** 2
+        
+        # Step 2: Compute H_norm (max gradient norm) - same as FedSAC's H = sqrt(max(gamma))
+        H_norm = np.sqrt(np.max(gamma)) if np.max(gamma) > 0 else 1.0
 
         for cluster_idx, cluster_users in enumerate(cluster_assignments):
             # Initialize cluster aggregate
@@ -517,10 +526,11 @@ class SketchedAirDefense:
             real_participating_counts.append(max(1, participating_count))
 
             # Add AWGN noise (simulating over-the-air transmission)
-            # [FIX] Remove lr dependency - noise power is a physical channel constant
-            # Noise power: P_noise = B * N0 (bandwidth * noise spectral density)
-            # noise_std = sqrt(P_noise / 2) / min_h (normalized by channel gain)
-            noise_std = np.sqrt(self.B * self.N0 / 2) / min_h
+            # [FIX] Compute zeta following FedSAC formula: zeta = sqrt(P[0]) * K / H_norm * min_h
+            # noise_std = sqrt(B*N0/2) * lr / zeta
+            zeta = np.sqrt(P[0]) * K / H_norm * min_h if H_norm > 0 else 1.0
+            noise_std = np.sqrt(self.B * self.N0 / 2) * self.args.lr / zeta if zeta > 0 else 0.0
+            
             for key in cluster_agg.keys():
                 noise = torch.randn_like(cluster_agg[key]) * noise_std
                 cluster_agg[key] = cluster_agg[key] + noise
@@ -684,12 +694,17 @@ class SketchedAirDefense:
 
     def apply_adaptive_attacks(self, w_locals, w_global, args):
         """
-        Apply adaptive attacks to Byzantine users' local models.
+        Apply attacks to Byzantine users' local models.
 
-        Supports three adaptive attack types:
+        Supports both adaptive and basic attack types:
+        Adaptive:
         - null_space: Exploits null space of projection matrix
         - slow_poison: Slow drift attack within predictor tolerance
         - predictor_proxy: Uses local predictor to evade detection
+
+        Basic:
+        - omni: Omniscient attack (sends negative gradient)
+        - gaussian: Random Gaussian noise attack
 
         Args:
             w_locals: List of local model weights
@@ -700,17 +715,18 @@ class SketchedAirDefense:
         """
         attack_type = args.attack
 
-        # Only process adaptive attacks
-        if attack_type not in ADAPTIVE_ATTACKS:
+        # Only process supported attacks
+        if attack_type not in ALL_SUPPORTED_ATTACKS:
             return w_locals
-
-        # Lazy import to avoid circular dependency
-        from .adaptive_attacks import (
-            NullSpaceAttack, SlowPoisoningAttack, PredictorProxyAttack
-        )
 
         w_locals_attacked = copy.deepcopy(w_locals)
         num_byz = args.num_byz
+
+        # Lazy import for adaptive attacks to avoid circular dependency
+        if attack_type in ADAPTIVE_ATTACKS:
+            from .adaptive_attacks import (
+                NullSpaceAttack, SlowPoisoningAttack, PredictorProxyAttack
+            )
 
         for user_idx in range(num_byz):
             # Get benign gradient (flattened)
@@ -719,7 +735,24 @@ class SketchedAirDefense:
                 self.device
             )
 
-            if attack_type == 'null_space':
+            # ========== Basic Attacks ==========
+            if attack_type == 'omni':
+                # Omniscient attack: send negative gradient (opposite direction)
+                poisoned_flat = -benign_flat
+
+            elif attack_type == 'gaussian':
+                # Gaussian attack: send random noise with same norm as benign
+                noise = torch.randn_like(benign_flat)
+                # Normalize noise to have same magnitude as benign gradient
+                benign_norm = torch.norm(benign_flat)
+                noise_norm = torch.norm(noise)
+                if noise_norm > 1e-8:
+                    poisoned_flat = noise * (benign_norm / noise_norm)
+                else:
+                    poisoned_flat = noise
+
+            # ========== Adaptive Attacks ==========
+            elif attack_type == 'null_space':
                 # Initialize attacker if needed
                 if 'null_space' not in self.attack_state:
                     self.attack_state['null_space'] = NullSpaceAttack(
@@ -840,10 +873,9 @@ class SketchedAirDefense:
                         self.cluster_states[cluster_idx] = {'members': set(), 'centroid_history': None}
                     self.cluster_states[cluster_idx]['members'].add(user_idx)
 
-        # Step 1.8: Apply adaptive attacks to Byzantine users (if using adaptive attack)
-        # This modifies w_locals for Byzantine users before aggregation
-        if args.attack in ADAPTIVE_ATTACKS:
-            w_locals = self.apply_adaptive_attacks(w_locals, w_global, args)
+        # Step 1.8: Attacks are now applied by MaliciousClient during train()
+        # The w_locals passed here already contain poisoned weights for Byzantine users
+        # (Previously apply_adaptive_attacks was called here, but that caused double-attack issues)
 
         # Step 2: Compute cluster updates with AirComp physical layer simulation
         # [FIX] Now also returns real_participating_counts for dynamic normalization
@@ -962,3 +994,96 @@ def Sketched_Defense_Aggregation(w_locals, args, w_global, defense_module, round
     return defense_module.aggregate_with_defense(
         w_locals, w_global, args, round_idx, P, G, H, reputation, q
     )
+
+
+def apply_adaptive_attacks_standalone(w_locals, w_global, args, attack_state,
+                                      sketcher, history_buffer, device):
+    """
+    在非 Sketched-AirDefense 聚合（如 byzantine / proposed）场景下复用自适应攻击逻辑。
+
+    说明：
+    - 支持 ADAPTIVE_ATTACKS 和 BASIC_ATTACKS，与 SketchedAirDefense 内部一致。
+    - predictor_proxy 需要历史 sketch；若历史不足则回退为负梯度攻击。
+    - history_buffer: deque of sketch tensors，形状 [sketch_dim]；长度不足 window_size 时视为历史不足。
+    """
+    attack_type = args.attack
+    if attack_type not in ALL_SUPPORTED_ATTACKS:
+        return w_locals
+
+    w_locals_attacked = copy.deepcopy(w_locals)
+    num_byz = args.num_byz
+
+    # 延迟导入自适应攻击类以避免循环依赖
+    if attack_type in ADAPTIVE_ATTACKS:
+        from .adaptive_attacks import (
+            NullSpaceAttack, SlowPoisoningAttack, PredictorProxyAttack
+        )
+
+    for user_idx in range(num_byz):
+        benign_flat = flatten_model_updates(
+            {k: w_locals[user_idx][k] - w_global[k] for k in sorted(w_global.keys())},
+            device
+        )
+
+        # ===== Basic attacks =====
+        if attack_type == 'omni':
+            poisoned_flat = -benign_flat
+
+        elif attack_type == 'gaussian':
+            noise = torch.randn_like(benign_flat)
+            benign_norm = torch.norm(benign_flat)
+            noise_norm = torch.norm(noise)
+            if noise_norm > 1e-8:
+                poisoned_flat = noise * (benign_norm / noise_norm)
+            else:
+                poisoned_flat = noise
+
+        # ===== Adaptive attacks =====
+        elif attack_type == 'null_space':
+            if 'null_space' not in attack_state:
+                attack_state['null_space'] = NullSpaceAttack(
+                    sketcher.S,
+                    device=device,
+                    attack_strength=getattr(args, 'attack_strength', 1.0)
+                )
+            attacker = attack_state['null_space']
+            poisoned_flat = attacker.generate_poison(benign_flat)
+
+        elif attack_type == 'slow_poison':
+            if 'slow_poison' not in attack_state:
+                attack_state['slow_poison'] = SlowPoisoningAttack(
+                    target_direction=None,
+                    alpha=getattr(args, 'poison_alpha', 0.05),
+                    decay_rate=getattr(args, 'poison_decay', 0.99),
+                    device=device
+                )
+            attacker = attack_state['slow_poison']
+            poisoned_flat = attacker.generate_poison(benign_flat)
+
+        elif attack_type == 'predictor_proxy':
+            if 'predictor_proxy' not in attack_state:
+                attack_state['predictor_proxy'] = PredictorProxyAttack(
+                    sketch_dim=sketcher.sketch_dim,
+                    hidden_dim=getattr(args, 'proxy_hidden', 64),
+                    window_size=args.window_size,
+                    threshold_margin=getattr(args, 'threshold_margin', 0.1),
+                    device=device
+                )
+            attacker = attack_state['predictor_proxy']
+
+            if history_buffer is not None and len(history_buffer) >= args.window_size:
+                history_tensor = torch.stack(list(history_buffer)[-args.window_size:])
+                poisoned_flat = attacker.generate_poison(
+                    benign_flat, sketcher, history_tensor
+                )
+            else:
+                poisoned_flat = -benign_flat
+
+        else:
+            poisoned_flat = benign_flat
+
+        poisoned_update = unflatten_model_updates(poisoned_flat, w_global, device)
+        for key in sorted(w_global.keys()):
+            w_locals_attacked[user_idx][key] = w_global[key].float() + poisoned_update[key]
+
+    return w_locals_attacked
