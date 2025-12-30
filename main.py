@@ -108,6 +108,7 @@ if __name__ == '__main__':
 
     # build model
     if args.model == 'cnn' and args.dataset == 'cifar':
+        print("now use the cnn")
         net_glob = CNN_v2(args=args).to(args.device)
     elif args.model == 'cnn' and args.dataset == 'mnist':
         net_glob = CNN_v1(args=args).to(args.device)
