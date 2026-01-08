@@ -13,7 +13,7 @@ from utils.distribute import uniform_distribute, train_dg_split
 from utils.sampling import iid, noniid
 from utils.options import args_parser
 from src.update import ModelUpdate
-from src.nets import MLP, CNN_v1, CNN_v2
+from src.nets import MLP, CNN_v1, CNN_v2, ResNet18_CIFAR
 from src.strategy import FedAvg, FedAvg_Byzantine, Secure_aggregation
 from src.test import test_img, test_ind_img
 from src.generate import generate_clients
@@ -72,6 +72,8 @@ if __name__ == '__main__':
             exit('Error: unrecognized sampling')
     
     elif args.dataset == 'cifar':
+        args.num_channels = 3
+        args.num_classes = 10
         trans_cifar = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         dataset = datasets.CIFAR10('E:/programming/trail for paper/data/cifar', train=True, download=True, transform=trans_cifar)
         dataset_test = datasets.CIFAR10('E:/programming/trail for paper/data/cifar', train=False, download=True, transform=trans_cifar)
@@ -117,6 +119,9 @@ if __name__ == '__main__':
         for x in img_size:
             len_in *= x
         net_glob = MLP(dim_in=len_in, dim_hidden=200, dim_out=args.num_classes).to(args.device)
+    elif args.model == 'resnet18' and args.dataset == 'cifar':
+        print("now use the resnet18")
+        net_glob = ResNet18_CIFAR(args=args).to(args.device)
     else:
         exit('Error: unrecognized model')
     

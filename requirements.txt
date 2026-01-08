@@ -1,0 +1,35 @@
+# Sketched-AirDefense Requirements (Extracted from FedSAC environment)
+
+# Core ML dependencies
+torch==2.0.1
+torchvision==0.15.2
+numpy==1.24.4
+scipy==1.10.1
+matplotlib==3.7.5
+tqdm==4.67.1
+
+# Visualization
+tensorboard==2.14.0
+seaborn==0.13.2
+
+# Optimization (Required for 'proposed' method in strategy.py)
+cvxpy==1.3.0
+Mosek==10.2.17
+ecos==2.0.14
+osqp==1.0.5
+scs==3.2.7.post2
+
+# Data and Utilities
+pandas==2.0.3
+Pillow==9.5.0
+scikit-learn==1.3.2
+sympy==1.13.3
+networkx==3.1
+python-dateutil==2.9.0.post0
+
+# Networking & System
+requests==2.32.4
+urllib3==2.2.3
+certifi==2025.10.5
+six==1.17.0
+filelock==3.16.1

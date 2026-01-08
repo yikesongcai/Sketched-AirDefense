@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torchvision import transforms
+from torchvision.models import resnet18
 
 class MLP(nn.Module):
     def __init__(self, dim_in, dim_hidden, dim_out):
@@ -106,3 +107,27 @@ class Alexnet(nn.Module):
         x = torch.flatten(x, 1)
         x = self.classifier(x)
         return x
+
+class ResNet18_CIFAR(nn.Module):
+    """
+    ResNet18 optimized for CIFAR-10 (32x32 images).
+    Modified from standard torchvision implementation:
+    - Initial conv1: 7x7 stride 2 -> 3x3 stride 1
+    - Initial maxpool: Removed (replaced with Identity)
+    """
+    def __init__(self, args):
+        super(ResNet18_CIFAR, self).__init__()
+        # Use standard resnet18 but adjust for 32x32 input
+        self.model = resnet18(weights=None)
+        
+        # CIFAR-10 images are 32x32. The default ResNet-18 has a 7x7 conv with stride 2 
+        # followed by a maxpool, which reduces 32x32 to 8x8 before the first residual block.
+        # This is too aggressive. We change it to 3x3 stride 1.
+        self.model.conv1 = nn.Conv2d(args.num_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.model.maxpool = nn.Identity()
+        
+        # Change output layer to match number of classes
+        self.model.fc = nn.Linear(512, args.num_classes)
+
+    def forward(self, x):
+        return self.model(x)
