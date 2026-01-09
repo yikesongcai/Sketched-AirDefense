@@ -3,11 +3,13 @@ import copy
 
 def get_model_flattened_dim(net):
     """
-    Calculate the total number of parameters in the model.
+    Calculate the total dimension of the model as flattened by state_dict.
+    Includes BatchNorm buffers (running_mean, etc) to ensure consistency with flatten_model_updates.
     """
     total_dim = 0
-    for param in net.parameters():
-        total_dim += param.numel()
+    state_dict = net.state_dict()
+    for key in state_dict.keys():
+        total_dim += state_dict[key].numel()
     return total_dim
 
 def flatten_model_updates(w_update, device):

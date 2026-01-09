@@ -22,35 +22,38 @@ import copy
 def project_to_null_space(v, S, SST_inv, device='cuda'):
     """
     Project vector v onto the null space of S WITHOUT computing the full d×d matrix.
-
-    Mathematical Background:
-    Instead of computing P_null = I - S^T (S S^T)^{-1} S (which is d×d and causes OOM),
-    we directly compute P_null · v using associativity:
-
-    P_null · v = (I - S^T (S S^T)^{-1} S) · v
-              = v - S^T · ((S S^T)^{-1} · (S · v))
-
-    This reduces complexity from O(d²) to O(kd) where k is sketch dimension.
-    Memory usage: Only need to store k×k matrix (S S^T)^{-1}, not d×d matrix.
-
-    Args:
-        v: Input vector to project [d]
-        S: Projection matrix [k, d] where k << d (k is sketch_dim)
-        SST_inv: Precomputed (S S^T)^{-1} matrix [k, k]
-        device: torch device
-    Returns:
-        projected: v projected onto null space of S [d]
+    Handles both sparse and dense S.
     """
     v = v.float().to(device)
 
     # Step 1: Compute sketch of v: S · v -> [k]
-    Sv = torch.mv(S, v)
+    # If S is sparse, it might be [d, k] or [k, d]
+    if S.is_sparse:
+        if S.shape[0] < S.shape[1]: # S is [k, d]
+            Sv = torch.sparse.mm(S, v.unsqueeze(-1)).squeeze()
+        else: # S is [d, k]
+            Sv = torch.sparse.mm(S.t(), v.unsqueeze(-1)).squeeze()
+    else:
+        # Dense handling
+        if S.shape[0] < S.shape[1]: # S is [k, d]
+            Sv = torch.mv(S, v)
+        else: # S is [d, k]
+            Sv = torch.mv(S.t(), v)
 
     # Step 2: Compute (S S^T)^{-1} · (S · v) -> [k]
     SST_inv_Sv = torch.mv(SST_inv, Sv)
 
     # Step 3: Compute S^T · ((S S^T)^{-1} · (S · v)) -> [d]
-    ST_SST_inv_Sv = torch.mv(S.T, SST_inv_Sv)
+    if S.is_sparse:
+        if S.shape[0] < S.shape[1]: # S is [k, d]
+            ST_SST_inv_Sv = torch.sparse.mm(S.t(), SST_inv_Sv.unsqueeze(-1)).squeeze()
+        else: # S is [d, k]
+            ST_SST_inv_Sv = torch.sparse.mm(S, SST_inv_Sv.unsqueeze(-1)).squeeze()
+    else:
+        if S.shape[0] < S.shape[1]: # S is [k, d]
+            ST_SST_inv_Sv = torch.mv(S.T, SST_inv_Sv)
+        else: # S is [d, k]
+            ST_SST_inv_Sv = torch.mv(S, SST_inv_Sv)
 
     # Step 4: P_null · v = v - S^T · ((S S^T)^{-1} · (S · v))
     projected = v - ST_SST_inv_Sv
@@ -61,32 +64,30 @@ def project_to_null_space(v, S, SST_inv, device='cuda'):
 def precompute_SST_inv(S, device='cuda', regularization=1e-6):
     """
     Precompute (S S^T)^{-1} for efficient null space projection.
-
-    This is a small k×k matrix (e.g., 256×256) that can be stored in memory.
-
-    Args:
-        S: Projection matrix [k, d] or [d, k]
-        device: torch device
-        regularization: Small value for numerical stability
-    Returns:
-        S_normalized: S in shape [k, d]
-        SST_inv: (S S^T + λI)^{-1} matrix [k, k]
+    Handles both sparse and dense S.
     """
-    S = S.float().to(device)
-
-    # Ensure S is in shape [k, d] where k < d (rows are projection directions)
-    if S.shape[0] > S.shape[1]:
-        S = S.T  # Transpose to [k, d]
-
-    k, d = S.shape
-
-    # Compute S S^T + regularization * I for numerical stability
-    SST = torch.mm(S, S.T) + regularization * torch.eye(k, device=device)
-
-    # Compute (S S^T)^{-1} - this is only k×k, very small!
-    SST_inv = torch.inverse(SST)
-
-    return S, SST_inv
+    if S.is_sparse:
+        S_sparse = S.to(device)
+        # Ensure it's [k, d] for computation
+        if S_sparse.shape[0] > S_sparse.shape[1]:
+            S_k_d = S_sparse.t()
+        else:
+            S_k_d = S_sparse
+        
+        k, d = S_k_d.shape
+        # Compute S S^T using sparse-sparse multiplication (result is small k x k dense matrix)
+        # In PyTorch, sparse @ sparse.T -> sparse, then we move to dense
+        SST = torch.sparse.mm(S_k_d, S_k_d.t()).to_dense() + regularization * torch.eye(k, device=device)
+        SST_inv = torch.inverse(SST)
+        return S_sparse, SST_inv
+    else:
+        S = S.float().to(device)
+        if S.shape[0] > S.shape[1]:
+            S = S.T  # Transpose to [k, d]
+        k, d = S.shape
+        SST = torch.mm(S, S.T) + regularization * torch.eye(k, device=device)
+        SST_inv = torch.inverse(SST)
+        return S, SST_inv
 
 
 class NullSpaceAttack:

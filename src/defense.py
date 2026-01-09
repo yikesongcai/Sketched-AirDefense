@@ -23,38 +23,46 @@ class GradientSketcher:
     Responsible for generating random projection matrix S and compressing
     high-dimensional gradients to low-dimensional sketches.
 
-    Physical meaning: Simulates compressed sensing or feature extraction
-    in AirComp transmission.
+    Memory-efficient version using Sparse Random Projection for large models.
     """
     def __init__(self, input_dim, sketch_dim, device):
-        """
-        Args:
-            input_dim: Original dimension of the gradient vector
-            sketch_dim: Target dimension of the sketch
-            device: torch device
-        """
         self.device = device
         self.input_dim = input_dim
         self.sketch_dim = sketch_dim
-        # Fixed random matrix S, ensuring consistent projection across rounds
-        # Using normal distribution initialization, satisfying JL Lemma isometric property
-        self.S = torch.randn(input_dim, sketch_dim).to(device) / (sketch_dim ** 0.5)
+        
+        # Threshold: 20M elements. For ResNet-18 (11M * 1024), we use sparse.
+        self.is_sparse = (input_dim * sketch_dim > 20_000_000)
+
+        if self.is_sparse:
+            # Sparse Random Projection: each row has exactly 's' non-zero entries
+            s = 8 
+            # Vectorized creation to avoid slow Python loops (~11M iterations)
+            row_indices = torch.arange(input_dim, device=device).view(-1, 1).repeat(1, s).view(-1)
+            col_indices = torch.randint(0, sketch_dim, (input_dim, s), device=device).view(-1)
+            indices = torch.stack([row_indices, col_indices])
+            
+            # Values are +/- 1 / sqrt(s)
+            values = (torch.randint(0, 2, (input_dim * s,), device=device).float() * 2 - 1) / (s ** 0.5)
+            
+            self.S = torch.sparse_coo_tensor(indices, values, (input_dim, sketch_dim)).to(device)
+            print(f"[GradientSketcher] Using Sparse Projection Matrix (Vectorized Init, s={s})")
+        else:
+            self.S = torch.randn(input_dim, sketch_dim).to(device) / (sketch_dim ** 0.5)
+            print(f"[GradientSketcher] Using Dense Projection Matrix ({input_dim}x{sketch_dim})")
 
     def sketch(self, update_vector):
         """
-        Compress gradient vector using random projection.
-
-        Args:
-            update_vector: Flattened gradient tensor [d]
-        Returns:
-            sketched_vector: Compressed tensor [sketch_dim]
+        Compress gradient vector. Handles both sparse and dense S.
         """
-        # Simple linear projection: s = x * S
-        return torch.matmul(update_vector, self.S)
+        if self.is_sparse:
+            # Efficient sparse-dense matrix multiplication
+            # S is [d, k], update_vector is [d]
+            return torch.sparse.mm(self.S.t(), update_vector.unsqueeze(-1)).squeeze()
+        else:
+            return torch.matmul(update_vector, self.S)
 
     def reset_projection(self):
-        """Reset the random projection matrix (optional, for experiments)"""
-        self.S = torch.randn(self.input_dim, self.sketch_dim).to(self.device) / (self.sketch_dim ** 0.5)
+        self.__init__(self.input_dim, self.sketch_dim, self.device)
 
 
 class TrajectoryPredictor(nn.Module):
