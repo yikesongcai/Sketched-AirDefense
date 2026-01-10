@@ -346,7 +346,7 @@ class SketchedAirDefense:
 
         # Physical layer parameters
         self.B = 1e+6  # Bandwidth
-        self.N0 = 1e-7 # Noise power spectral density
+        self.N0 = 0 # Noise power spectral density
 
         # Defense-aware training parameters
         self.lambda_adv = getattr(args, 'lambda_adv', 0.5)  # Adversarial loss weight
