@@ -1,4 +1,6 @@
 import torch
+import sys
+import os
 from torchvision import datasets, transforms
 # from torch.utils.tensorboard import SummaryWriter
 
@@ -25,7 +27,26 @@ from src.client import Client, MaliciousClient
 
 # writer = SummaryWriter()
 
+class Logger(object):
+    def __init__(self, filename='runs/e-log'):
+        self.terminal = sys.stdout
+        self.log = open(filename, 'w', encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 if __name__ == '__main__':
+    # Initialize logging
+    if not os.path.exists('runs'):
+        os.makedirs('runs')
+    sys.stdout = Logger('runs/e-log')
+
     # parse args
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
