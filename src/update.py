@@ -36,7 +36,9 @@ class ModelUpdate(object):
         net.train()
     
         # train and update
-        optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr*1**(self.rnds//10), momentum=self.args.momentum)
+        # Learning rate decay: halve every 100 rounds
+        lr = self.args.lr * (0.5 ** (self.rnds // 100))
+        optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=self.args.momentum)
         epoch_loss = []
         
         local_ep = self.args.local_ep

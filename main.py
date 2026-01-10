@@ -74,7 +74,12 @@ if __name__ == '__main__':
     elif args.dataset == 'cifar':
         args.num_channels = 3
         args.num_classes = 10
-        trans_cifar = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        trans_cifar = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
         dataset = datasets.CIFAR10('E:/programming/trail for paper/data/cifar', train=True, download=True, transform=trans_cifar)
         dataset_test = datasets.CIFAR10('E:/programming/trail for paper/data/cifar', train=False, download=True, transform=trans_cifar)
         
