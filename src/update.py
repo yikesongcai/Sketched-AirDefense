@@ -29,7 +29,7 @@ class ModelUpdate(object):
         self.data_size = data_size
         self.flag_byz = flag_byz
         self.loss_func = nn.CrossEntropyLoss()
-        self.ldr_train = DataLoader(DatasetSplit(dataset, idxs), batch_size=self.data_size, shuffle=True)#self.args.bs
+        self.ldr_train = DataLoader(DatasetSplit(dataset, idxs), batch_size=self.args.local_bs, shuffle=True)
 
     def train(self, local_net, net):
         
@@ -38,7 +38,7 @@ class ModelUpdate(object):
         # train and update
         # Learning rate decay: halve every 100 rounds
         lr = self.args.lr * (0.5 ** (self.rnds // 100))
-        optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=self.args.momentum)
+        optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=self.args.momentum, weight_decay=5e-4)
         epoch_loss = []
         
         local_ep = self.args.local_ep
