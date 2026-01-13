@@ -903,6 +903,10 @@ class SketchedAirDefense:
         # Step 4: Predict and detect anomalies
         trust_weights, anomaly_scores, _ = self.predict_and_detect(current_sketches)
 
+        # [NEW] Baseline: Use uniform weights if requested
+        if getattr(args, 'no_weight_pred', False):
+            trust_weights = torch.ones(self.num_clusters, device=self.device) / self.num_clusters
+
         # Step 5: Update predictor with defense-aware loss
         predictor_loss_info = self.update_predictor_selective(
             current_sketches, anomaly_scores, trust_weights

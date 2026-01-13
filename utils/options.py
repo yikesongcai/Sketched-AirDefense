@@ -69,6 +69,7 @@ def args_parser():
     parser.add_argument('--lambda_adv', type=float, default=0.5, help="weight for adversarial loss in defense-aware training")
     parser.add_argument('--warmup_rounds', type=int, default=3, help="soft-landing warmup rounds after cluster switch")
     parser.add_argument('--use_defense_aware', action='store_true', default=False, help="use defense-aware LSTM predictor instead of GRU")
+    parser.add_argument('--no_weight_pred', action='store_true', default=False, help="skip weight prediction and use uniform constant weights")
 
 
     args = parser.parse_args()
