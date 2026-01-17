@@ -901,7 +901,7 @@ class SketchedAirDefense:
             self.cluster_states[cluster_idx]['centroid_history'] = current_sketches[cluster_idx].detach().clone()
 
         # Step 4: Predict and detect anomalies
-        trust_weights, anomaly_scores, _ = defense_module.predict_and_detect(current_sketches)
+        trust_weights, anomaly_scores, _ = self.predict_and_detect(current_sketches)
 
         # [NEW] Baseline: Use uniform weights if requested
         if getattr(args, 'no_weight_pred', False):
