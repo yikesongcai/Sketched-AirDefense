@@ -2,3 +2,5 @@ docs
 runs
 __pycache__
 *.pyc
+prompt
+tools
