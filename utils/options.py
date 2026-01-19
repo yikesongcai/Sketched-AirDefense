@@ -15,7 +15,7 @@ def args_parser():
     parser.add_argument('--lr', type=float, default=0.005, help="client learning rate")
     parser.add_argument('--momentum', type=float, default=0, help="SGD momentum (default: 0.5)")
     parser.add_argument('--classwise', type=int, default=10, help="number of images for each class (global dataset)")
-    parser.add_argument('--alpha', type=float, default=0.05, help="random portion of global dataset")
+    parser.add_argument('--alpha', type=float, default=0.1, help="Dirichlet concentration parameter for non-IID partitioning (closer to 0 is more non-IID)")
 
     # other arguments
     parser.add_argument('--dataset', type=str, default='mnist', help="name of dataset")

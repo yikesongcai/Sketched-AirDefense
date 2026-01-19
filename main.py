@@ -58,16 +58,19 @@ if __name__ == '__main__':
     result_acc=[]
     result_loss=[]
     
-    non_iid_p=[[] for i in range(args.num_users)]
-    for i in range(args.num_users-1):
-        temp=np.random.randint(50,60, size=args.num_classes)
-        #temp=np.zeros(args.num_classes)
-        ii=i%10
-        temp[ii]=1000
-        temp=temp/sum(temp)
-        non_iid_p[i].extend(temp)
-    temp=np.ones(args.num_classes)/args.num_classes
-    non_iid_p[args.num_users-1].extend(temp)
+    # non-IID distribution probability matrix
+    if args.sampling == 'noniid':
+        # Probability distribution for Dirichlet Non-IID
+        # args.alpha: concentration parameter (higher = more uniform)
+        non_iid_matrix = np.random.dirichlet([args.alpha] * args.num_classes, size=args.num_users-1)
+        non_iid_p = non_iid_matrix.tolist()
+        
+        # Last user (server) gets uniform distribution
+        temp = np.ones(args.num_classes) / args.num_classes
+        non_iid_p.append(temp.tolist())
+    else:
+        # Uniform distribution for iid
+        non_iid_p = [([1.0 / args.num_classes] * args.num_classes) for _ in range(args.num_users)]
 
     # load dataset and split users
     if args.dataset == 'mnist':
