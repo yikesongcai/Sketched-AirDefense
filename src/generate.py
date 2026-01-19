@@ -5,6 +5,7 @@ import math
 
 def generate_clients(args):
     distance = np.random.rand(args.num_users)
+    distance.sort() # Ensure users with similar indices (e.g. Byzantine) are grouped in location-based clustering
     distance = distance * 300 + 200
     P = np.ones(args.num_users)
     P = P * 10**(args.power/10)
