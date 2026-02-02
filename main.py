@@ -1,6 +1,8 @@
 import torch
 import sys
 import os
+import json
+import datetime
 from torchvision import datasets, transforms
 # from torch.utils.tensorboard import SummaryWriter
 
@@ -42,14 +44,27 @@ class Logger(object):
         self.log.flush()
 
 if __name__ == '__main__':
-    # Initialize logging
-    if not os.path.exists('runs'):
-        os.makedirs('runs')
-    sys.stdout = Logger('runs/e-log')
-
-    # parse args
+    # parse args first to use in directory name
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
+
+    # Create structured experiment directory
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = f"{timestamp}_{args.dataset}_{args.model}_{args.attack}_byz{args.num_byz}"
+    exp_dir = os.path.join('runs', exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    # Save config.json
+    config_path = os.path.join(exp_dir, 'config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        # Convert args namespace to dict, handle non-serializable types
+        config_dict = {k: str(v) if not isinstance(v, (int, float, bool, str, list, type(None))) else v 
+                       for k, v in vars(args).items()}
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    # Initialize metrics list for per-round logging
+    metrics_list = []
+    metrics_path = os.path.join(exp_dir, 'metrics.json')
  
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -300,6 +315,18 @@ if __name__ == '__main__':
                 print(f"[Defense] Trust weights: {defense_info['trust_weights']}")
             result_acc.append(float(acc_test))
             result_loss.append(float(loss_test))
+
+        # Collect metrics for JSON logging
+        round_metrics = {
+            'round': iter,
+            'accuracy': float(acc_test),
+            'loss': float(loss_test),
+        }
+        if defense_info is not None:
+            round_metrics['predictor_loss'] = defense_info['predictor_loss']
+            round_metrics['history_size'] = defense_info['history_size']
+            round_metrics['trust_weights'] = defense_info['trust_weights']
+        metrics_list.append(round_metrics)
         
         # tensorboard
         if args.tsboard:
@@ -311,6 +338,10 @@ if __name__ == '__main__':
             #     for c, w in enumerate(defense_info['trust_weights']):
             #         writer.add_scalar(f"Defense/trust_weight_cluster_{c}", w, iter)
     
+    # Save metrics.json at end of training
+    with open(metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics_list, f, indent=2, ensure_ascii=False)
+    print(f"[Logging] Metrics saved to {metrics_path}")
     
     plt.plot(range(args.rounds),result_acc)
     plt.show()
